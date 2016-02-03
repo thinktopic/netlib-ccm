@@ -1,0 +1,7 @@
+(ns netlib-ccm.core-test
+  (:require [clojure.test :refer :all]
+            [netlib-ccm.core :refer :all]))
+
+(deftest a-test
+  (testing "FIXME, I fail."
+    (is (= 0 1))))
