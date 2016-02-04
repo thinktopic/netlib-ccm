@@ -36,7 +36,7 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
 (defn assign-strided-view!
   [^StridedView lhs ^StridedView rhs]
   (strided-op lhs rhs (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
-                        (System/arraycopy ^doubles lhs-data ^long lhs-offset ^doubles rhs-data ^long rhs-offset
+                        (System/arraycopy ^doubles rhs-data ^long rhs-offset ^doubles lhs-data ^long lhs-offset
                                           ^long op-len))))
 
 (defn clone-strided-view
@@ -68,8 +68,6 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
   (^long rowCount [])
   (^long columnCount [])
   (^netlib_ccm.core.AbstractMatrix clone []))
-
-(declare deep-copy-array-view deep-copy-matrix-view)
 
 (deftype DenseArray [^doubles data ^long offset ^long length]
   netlib_ccm.core.NetlibItem
