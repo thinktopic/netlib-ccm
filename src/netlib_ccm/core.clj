@@ -10,55 +10,173 @@
 (set! *unchecked-math* :warn-on-boxed)
 
 ;;A view on the data that could be non-contiguous
-(defrecord StridedView [^doubles data ^long offset ^long row-count ^long column-count ^long row-stride])
+;;Initial column count means the number of items in the
+;;first row of the strided view.
+;;Thus the strided view data actually starts at offset
+;;  (+ offset (- column-count initial-column-count))
+;;Furthermore initial-column-count and last-column-count
+;;must be <= column-count
+(defrecord StridedView [^doubles data ^long offset ^long row-count ^long column-count
+                        ^long row-stride ^long initial-column-count ^long last-column-count])
+
+(defn new-strided-view
+  (^StridedView [data offset row-count column-count
+                 row-stride initial-column-count last-column-count]
+   (->StridedView data offset row-count column-count
+                  row-stride initial-column-count last-column-count))
+
+  (^StridedView [data offset row-count column-count row-stride]
+   (->StridedView data offset row-count column-count row-stride column-count 0))
+  (^StridedView [^doubles data ^long offset ^long row-count ^long column-count]
+   (->StridedView data offset row-count column-count column-count column-count 0))
+  (^StridedView [^doubles data ^long offset ^long length]
+   (->StridedView data offset 1 length length length 0)))
+
+
+(defn check-strided-view-row-index
+  [^StridedView view, ^long row-idx]
+  (when (>= row-idx (.row-count view))
+    (throw (Exception. "Attempt to access past end of view")))
+  (when (< row-idx 0)
+    (throw (Exception. "Attempt to access before beginning of view"))))
+
+(defn get-strided-view-column-count
+  ^long [^StridedView view, ^long row]
+  (cond
+    (= row 0) (.initial-column-count view)
+    (= row (- (.row-count view) 1)) (.last-column-count view)
+    :else (.column-count view)))
+
+(defn get-strided-view-data-length
+  ^long [^StridedView view]
+  (+ (* (max 0 (- (.row-count view) 2)) (.column-count view))
+     (.initial-column-count view)
+     (.last-column-count view)))
+
+(defn check-strided-view-data-offset
+  [^StridedView view ^long data-offset]
+  (when (< data-offset 0)
+    (throw (Exception. "Attempt to access before beginning of view")))
+  (when (>= data-offset (get-strided-view-data-length view))
+    (throw (Exception. "Attempt to access past end of view"))))
+
+(defn get-strided-view-row-from-data-offset
+  ^long [^StridedView view ^long data-offset]
+  (check-strided-view-data-offset view data-offset)
+  (if (< data-offset (.initial-column-count view))
+    0
+    (let [data-offset (- data-offset (.initial-column-count view))]
+      (+ 1 (quot data-offset (.column-count view))))))
+
+(defn get-strided-view-row-length-from-data-offset
+  ^long [^StridedView view ^long data-offset]
+  (check-strided-view-data-offset view data-offset)
+  (if (< data-offset (.initial-column-count view))
+    (- (.initial-column-count view) data-offset)
+    (let [rest-offset (- data-offset (.initial-column-count view))
+          row-idx (+ 1 (quot rest-offset (.column-count view)))
+          rest-leftover (rem rest-offset (.column-count view))]
+      (if (= row-idx (- (.row-count view) 1))
+        (- rest-leftover (.last-column-count view))
+        (- rest-leftover (.column-count view))))))
+
+
+(defn get-strided-view-total-offset
+  ^long [^StridedView view ^long data-offset]
+  (check-strided-view-data-offset view data-offset)
+  (let [data-len (get-strided-view-data-length view)
+        body-len (* (.column-count view) (max 0 (- (.row-count view) 2)))]
+    (if (< data-offset (.initial-column-count view))
+      (+ (+ (.offset view) (- (.column-count view) (.initial-column-count view)))
+         data-offset)
+      (let [data-rest (- data-offset (.initial-column-count view))]
+        (+ (.offset view)
+           (* (.row-stride view) (+ 1 (quot data-rest (.column-count view))))
+           (rem data-rest (.column-count view)))))))
+
+
+(defn create-sub-strided-view
+  [^StridedView view ^long offset ^long length]
+  (check-strided-view-data-offset view offset)
+  (check-strided-view-data-offset view (+ offset (max 0 (- length 1))))
+  (let [data-len (get-strided-view-data-length view)]
+    (let [start-submat-offset (- (get-strided-view-total-offset view offset) (.offset view))
+          ini-col-offset (rem start-submat-offset (.column-count view))
+          ini-col-len (- (.column-count view) ini-col-offset)
+          end-col-len (rem (- length ini-col-len) (.column-count view))
+          body-num-rows (/ (- length (+ ini-col-len end-col-len))
+                           (.row-stride view))
+          ini-row (long (if-not (= 0 ini-col-len) 1 0))
+          end-row (long (if-not (= 0 end-col-len) 1 0))]
+      (new-strided-view (.data view) (.offset view)
+                        (+ body-num-rows ini-row end-row)
+                        (.column-count view)
+                        (.row-stride view)
+                        ini-col-len
+                        end-col-len))))
 
 (defn strided-op
   "Perform an operation such as (assign! lhs rhs).
 Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amount"
   [^StridedView lhs ^StridedView rhs op]
-  (let [rhs-data-stride (.column-count rhs)
-        lhs-data-stride (.column-count lhs)]
-      (loop [rhs-row 0]
-        (when (< rhs-row (.row-count rhs))
-          (loop [rhs-data-offset 0]
-            (when (< rhs-data-offset rhs-data-stride)
-              (let [rhs-data-copied (+ rhs-data-offset (* rhs-row (.column-count rhs)))
-                    lhs-data-offset (rem rhs-data-copied lhs-data-stride)
-                    lhs-row (quot rhs-data-copied lhs-data-stride)
-                    op-amount (min (- lhs-data-stride lhs-data-offset)
-                                   (- rhs-data-stride rhs-data-offset))
-                    lhs-offset (+ (.offset lhs) (* lhs-row (.row-stride lhs)) lhs-data-offset)
-                    rhs-offset (+ (.offset rhs) (* rhs-row (.row-stride rhs)) rhs-data-offset)]
-                (op (.data lhs) lhs-offset (.data rhs) rhs-offset op-amount)
-                (recur (+ rhs-data-offset op-amount)))))
-          (recur (inc rhs-row))))))
+  (loop [rhs-row 0]
+    (when (< rhs-row (.row-count rhs))
+      (let [data-offset (+ (* (.row-stride rhs) (max 0 (- (.row-count rhs) 2)))
+                           (.initial-column-count rhs))
+            rhs-row-len (get-strided-view-column-count rhs rhs-row)]
+       (loop [rhs-row-offset 0]
+         (when (< rhs-row-offset rhs-row-len)
+           (let [data-offset (+ data-offset rhs-row-offset)
+                 rhs-total-offset (get-strided-view-total-offset data-offset)
+                 rhs-row-len (- rhs-row-len rhs-row-offset)
+                 lhs-row (get-strided-view-row-from-data-offset lhs data-offset)
+                 lhs-row-len (get-strided-view-row-length-from-data-offset lhs data-offset)
+                 lhs-total-offset (get-strided-view-total-offset data-offset)
+                 op-amount (min lhs-row-len rhs-row-len)]
+             (op (.data lhs) lhs-total-offset
+                 (.data rhs) rhs-total-offset
+                 op-amount)
+             (recur (+ rhs-row-offset op-amount))))))
+      (recur (inc rhs-row)))))
+
 
 (defn assign-strided-view!
+  "lhs must be at least as large as rhs"
   [^StridedView lhs ^StridedView rhs]
   (strided-op lhs rhs (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
-                        (System/arraycopy ^doubles rhs-data ^long rhs-offset ^doubles lhs-data ^long lhs-offset
+                        (System/arraycopy ^doubles rhs-data ^long rhs-offset
+                                          ^doubles lhs-data ^long lhs-offset
                                           ^long op-len))))
 
 (defn clone-strided-view
   "Create a packed strided view from potentially non-dense view"
   ^StridedView [^StridedView source]
   (let [num-items (* (.row-count source) (.column-count source))
-        ^doubles data (make-array ^doubles num-items)
-        retval (->StridedView data 0 1 num-items num-items)]
-    (assign-strided-view retval source)
+        ^doubles data (make-array Double/TYPE num-items)
+        retval (new-strided-view data 0 1 num-items num-items)]
+    (assign-strided-view! retval source)
     retval))
+
+(defn validate-strided-view-shape [^StridedView data]
+  (let [data-len (count (.data data))
+        item-end (+ (.offset data)
+                    (* (- (.row-count data) 1) (.row-stride data))
+                    (.column-count data))]
+    (when (> item-end data-len)
+      (throw (Exception. "Invalid strided view")))))
 
 
 (definterface NetlibItem)
 
 (definterface AbstractView
-  (^StridedView getStridedView []))
+  (^netlib_ccm.core.StridedView getStridedView []))
 
 (definterface AbstractVector
   (^double get [^long idx])
   (set [^long idx ^double val])
   (^long length [])
-  (^netlib_ccm.core.AbstractVector clone []))
+  (^netlib_ccm.core.AbstractVector clone [])
+  (validateShape []))
 
 (definterface AbstractMatrix
   (^double get [^long row ^long column])
@@ -67,72 +185,173 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
   (setRow [^long row ^netlib_ccm.core.AbstractVector data])
   (^long rowCount [])
   (^long columnCount [])
-  (^netlib_ccm.core.AbstractMatrix clone []))
+  (^netlib_ccm.core.AbstractMatrix clone [])
+  (validateShape []))
 
-(deftype DenseArray [^doubles data ^long offset ^long length]
+(declare ->DenseVector ->DenseMatrix)
+
+(deftype DenseVector [^doubles data ^long offset ^long length]
   netlib_ccm.core.NetlibItem
   netlib_ccm.core.AbstractView
-  (^StridedView getStridedView [] (->StridedView data offset 1 length length))
+  (^StridedView getStridedView [this] (new-strided-view data offset 1 length length))
 
   netlib_ccm.core.AbstractVector
   (^double get [this ^long idx] (aget data (+ offset idx)))
   (set [this ^long idx ^double val] (aset data (+ offset idx) val))
   (^long length [this] length)
-  (^netlib_ccm.core.AbstractVector clone [this] (let [retval (clone-strided-view (.getStridedView this))]
-                                                  (->DenseArray (.data retval) 0 length)))
+  (^netlib_ccm.core.AbstractVector clone [this]
+   (let [retval (clone-strided-view (.getStridedView this))]
+     (->DenseVector (.data retval) 0 length)))
+  (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
 
   clojure.lang.Seqable
   (seq [this] (map #(.get this %) (range length))))
 
 
-(deftype DenseMatrix [^DenseArray data ^long row-count ^long column-count]
+(deftype DenseMatrix [^DenseVector data ^long row-count ^long column-count]
   netlib_ccm.core.NetlibItem
   netlib_ccm.core.AbstractView
-  (^StridedView getStridedView [] (let [item-count (* row-count column-count)]
-                                    (->StridedView (.data data) (.offset data) 1 item-count item-count)))
+  (^StridedView getStridedView [this]
+   (let [item-count (* row-count column-count)]
+     (new-strided-view (.data data) (.offset data)
+                    1 item-count item-count)))
   netlib_ccm.core.AbstractMatrix
-  (^double get [this ^long row ^long column] (aget ^doubles (.data data) (+ (.offset data)
-                                                                            column
-                                                                            (* row column-count))))
-  (set [this ^long row ^long column ^double val] (aset ^doubles (.data data)
-                                                       (+ (.offset data)
-                                                          column
-                                                          (* row column-count))
-                                                       val))
-  (^netlib_ccm.core.AbstractVector getRow [this ^long row] (->DenseArray ^doubles (.data data)
-                                                                         (+ (.offset data)
-                                                                            (* row column-count))
-                                                                         column-count))
+  (^double get [this ^long row ^long column]
+   (aget ^doubles (.data data)
+         (+ (.offset data)
+            column
+            (* row column-count))))
+  (set [this ^long row ^long column ^double val]
+    (aset ^doubles (.data data)
+          (+ (.offset data)
+             column
+             (* row column-count))
+          val))
+  (^netlib_ccm.core.AbstractVector getRow [this ^long row]
+   (->DenseVector ^doubles (.data data)
+                 (+ (.offset data)
+                    (* row column-count))
+                 column-count))
   (setRow [this ^long row ^netlib_ccm.core.AbstractVector data]
     (let [^AbstractView strided-data data
           ^AbstractView row-data (.getRow this row)]
-      (assign-strided-view (.getStridedView row-data)
-                           (.getStridedView strided-data))))
+      (assign-strided-view! (.getStridedView row-data)
+                            (.getStridedView strided-data))))
   (^long rowCount [this] row-count)
   (^long columnCount [this] column-count)
-  (^netlib_ccm.core.AbstractMatrix clone [this] (deep-copy-matrix-view this)))
+  (^netlib_ccm.core.AbstractMatrix clone [this]
+   (let [retval (clone-strided-view (.getStridedView this))
+         ary (->DenseVector (.data retval) 0 (* row-count column-count))]
+     (->DenseMatrix ary row-count column-count)))
+  (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
+  clojure.lang.Seqable
+  (seq [this] (map #(.getRow this %) (range (.rowCount this)))))
+
+(declare strided-view-to-vector)
 
 ;;A strided view of data where you can have N contiguous elements separated in rows of length Y.
 ;;Think of a small submatrix in a larger one
-(deftype StridedDenseMatrix [^DenseArray data ^long row-count ^long column-count ^long row-stride])
+(deftype StridedMatrix [^StridedView data row-count column-count]
+  netlib_ccm.core.NetlibItem
+  netlib_ccm.core.AbstractView
+  (^StridedView getStridedView [this] data)
+
+  netlib_ccm.core.AbstractMatrix
+  (^double get [this ^long row ^long column]
+   (aget ^doubles (.data data)
+         (get-strided-view-total-offset data (+ (* column-count row) column))))
+
+  (set [this ^long row ^long column ^double val]
+    (aset ^doubles (.data data)
+          (get-strided-view-total-offset data (+ (* column-count row) column))
+          val))
+
+  (^netlib_ccm.core.AbstractVector getRow [this ^long row]
+   (let [sub-view (create-sub-strided-view data (* column-count row) column-count)]
+     (strided-view-to-vector sub-view)))
+
+  (setRow [this ^long row ^netlib_ccm.core.AbstractVector data]
+    (let [^AbstractView strided-data data
+          ^AbstractView row-data (.getRow this row)]
+      (assign-strided-view! (.getStridedView row-data)
+                            (.getStridedView strided-data))))
+
+  (^long rowCount [this] row-count)
+  (^long columnCount [this] column-count)
+  (^netlib_ccm.core.AbstractMatrix clone [this]
+   (let [retval (clone-strided-view (.getStridedView this))
+         ary (->DenseVector (.data retval) 0 (* (.row-count data) (.column-count data)))]
+     (->DenseMatrix ary (.row-count data) (.column-count data))))
+  (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
+
+  clojure.lang.Seqable
+  (seq [this] (map #(.getRow this %) (range (.rowCount this)))))
+
 ;;Interpret a submatrix as an array
-(deftype StridedDenseArray [^StridedDenseMatrix data])
+(deftype StridedVector [^StridedView data]
+  netlib_ccm.core.NetlibItem
+  netlib_ccm.core.AbstractView
+  (^StridedView getStridedView [this] data)
 
-(defn deep-copy-array-view
-  (^DenseArray [^DenseArray item ^long offset ^long length]
-   (let [max-possible (min length (max 0 (- (.length item) offset)))
-         new-data (make-array Double/TYPE max-possible)
-         ^doubles data (.data item)]
-     (System/arraycopy data (+ offset (.offset item)) new-data 0 max-possible)
-     (->DenseArray new-data 0 max-possible)))
-  (^DenseArray [^DenseArray item]
-   (deep-copy-array-view item 0 (.length item))))
+  netlib_ccm.core.AbstractVector
+  (^double get [this ^long idx]
+   (aget ^doubles (.data data) (get-strided-view-total-offset data idx)))
+
+  (set [this ^long idx ^double val]
+    (aset ^doubles (.data data) (get-strided-view-total-offset data idx) val))
+
+  (^long length [this] (* (.row-count data) (.column-count data)))
+
+  (^netlib_ccm.core.AbstractVector clone [this]
+   (strided-view-to-vector (clone-strided-view (.getStridedView this))))
+
+  (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
+
+  clojure.lang.Seqable
+  (seq [this] (map #(.get this %) (range (.length this)))))
 
 
-(defn deep-copy-matrix-view
-  ^DenseMatrix [^DenseMatrix item]
-  (let [new-data (deep-copy-array-view (.data item))]
-    (->DenseMatrix new-data (.row-count item) (.column-count item))))
+(defn get-column
+  ^StridedVector [^AbstractMatrix mat ^long column]
+  (let [^AbstractView mat mat
+        ^StridedView view (.getStridedView mat)]
+    (when-not (= (.column-count view) (.initial-column-count view))
+      (throw (Exception. "Unsupported")))
+    (->StridedVector (new-strided-view (.data view)
+                                      (+ (.offset view) column)
+                                      (.row-count view)
+                                      1
+                                      (.row-stride view)))))
+
+(defn strided-view-to-vector
+  ^AbstractVector [^StridedView view]
+  (if (or (= 1 (.row-count view))
+          (= (.row-stride view) (.column-count view)))
+    (->DenseVector (.data view) (get-strided-view-total-offset view 0)
+                   (get-strided-view-data-length view))
+    (->StridedVector view)))
+
+
+(defn set-column
+  [^AbstractMatrix mat ^long column ^AbstractVector data]
+  (let [^AbstractView col-view (get-column mat column)
+        ^StridedView column (.getStridedView col-view)
+        ^StridedView data-view (.getStridedView ^AbstractView data)]
+    (assign-strided-view! column data-view)))
+
+
+(defn new-dense-vector-from-strided-view
+  ^DenseVector [^StridedView view]
+  (let [new-view (clone-strided-view view)]
+    (->DenseVector (.data new-view) 0 (* (.row-count new-view) (.column-count new-view)))))
+
+
+(defn new-dense-matrix-from-strided-view
+  ^DenseMatrix [^StridedView view row-count column-count]
+  (let [^DenseVector new-vec (new-dense-vector-from-strided-view view)
+        ^DenseMatrix retval (->DenseMatrix new-vec row-count column-count)]
+    (.validateShape retval)
+    retval))
 
 
 (defn in-range
@@ -140,22 +359,22 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
   (and (>= item min-eq)
        (< max)))
 
-(defn new-array-view
-  [^long length]
+(defn new-dense-vector
+  ^DenseVector [^long length]
   (let [new-data (make-array Double/TYPE length)]
-    (->DenseArray new-data 0 length)))
+    (->DenseVector new-data 0 length)))
 
-(defn new-array-view-from-array
-  [^doubles double-array]
+(defn new-dense-vector-from-array
+  ^DenseVector [^doubles double-array]
   (let [len (count double-array)]
-    (->DenseArray double-array 0 len)))
+    (->DenseVector double-array 0 len)))
 
 (defn double-array-from-data
-  [data]
+  ^doubles [data]
   (double-array (ma/eseq data)))
 
-(defn new-array-view-from-data
-  [data]
+(defn new-dense-vector-from-data
+  ^DenseVector [data]
   (new-array-view-from-array (double-array-from-data data)))
 
 (defn do-construct-matrix
@@ -163,8 +382,8 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
   (let [shape (ma/shape data)
         num-shape (count shape)]
     (case num-shape
-      1 (new-array-view-from-array (double-array-from-data data))
-      2 (->DenseMatrix (new-array-view-from-array
+      1 (new-dense-vector-from-array (double-array-from-data data))
+      2 (->DenseMatrix (new-dense-vector-from-array
                         (double-array-from-data data))
                        (first shape)
                        (second shape)))))
@@ -172,63 +391,49 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
 (defn do-new-matrix-nd
   [shape]
   (case (count shape)
-    1 (new-array-view (first shape))
-    2 (->DenseMatrix (new-array-view (* (long (first shape)) (long (second shape)))
-                                     (first shape) (second shape)))))
+    1 (new-dense-vector (first shape))
+    2 (->DenseMatrix (new-dense-vector (* (long (first shape)) (long (second shape)))
+                                      (first shape) (second shape)))))
 
-(eval
- `(extend-protocol mp/PImplementation
-    ~@(mapcat (fn [sym]
-                (cons sym
-                      '(
-                        (implementation-key [m] :netlib)
-                        (supports-dimensionality? [m dims] (in-range dims 0 3))
-                        (construct-matrix [m data] (do-construct-matrix data))
-                        (new-vector [m length] (new-array-view length))
-                        (new-matrix [m rows columns] (->DenseMatrix (new-array-view (* rows columns) rows columns)))
-                        (new-matrix-nd [m shape] (do-new-matrix-nd shape)))))
-        ['DenseArray 'DenseMatrix])))
+
+(extend-protocol mp/PImplementation
+  NetlibItem
+  (implementation-key [m] :netlib)
+  (supports-dimensionality? [m dims] (in-range dims 0 3))
+  (construct-matrix [m data] (do-construct-matrix data))
+  (new-vector [m length] (new-dense-vector length))
+  (new-matrix [m rows columns] (->DenseMatrix (new-dense-vector (* rows columns)) rows columns))
+  (new-matrix-nd [m shape] (do-new-matrix-nd shape)))
 
 
 (extend-protocol mp/PDimensionInfo
-  DenseArray
+  AbstractVector
   (dimensionality [m] 1)
   (get-shape [m] [(.length m)])
   (is-scalar? [m] false)
   (is-vector? [m] true)
   (dimension-count [m dim] (if (= 0 dim) (.length m) (throw (Exception. "Unsupported"))))
-  DenseMatrix
+  AbstractMatrix
   (dimensionality [m] 2)
-  (get-shape [m] [(.row-count m) (.column-count m)])
+  (get-shape [m] [(.rowCount m) (.columnCount m)])
   (is-scalar? [m] false)
-  (is-vector? [m] true)
+  (is-vector? [m] false)
   (dimension-count [m dim]
     (case (long dim)
-      0 (.row-count m)
-      1 (.column-count m)
+      0 (.rowCount m)
+      1 (.columnCount m)
       (throw (Exception. "Unsupported")))))
 
 (extend-protocol mp/PIndexedAccess
-  DenseArray
-  (get-1d [m row] (let [^DenseArray view m
-                        view-data ^doubles (.data view)]
-                    (aget view-data (+ (long row) (.offset view)))))
+  AbstractVector
+  (get-1d [m row] (.get m row))
   (get-2d [m row column] (throw (Exception. "Unsupported")))
   (get-nd [m indexes] (if (= 1 (count indexes))
                         (mp/get-1d m (first indexes))
                         (throw (Exception. "Unsupported"))))
-  DenseMatrix
-  (get-1d [m row] (let [^DenseMatrix m m
-                        row-stride (.column-count m)
-                        row-offset (* row-stride row)
-                        ^DenseArray m-data (.data m)]
-                    (->DenseArray (.data m-data) (+ (.offset m-data) row-offset) row-stride)))
-  (get-2d [m row column] (let [^DenseMatrix m m
-                               row-stride (.column-count m)
-                               row-offset (* row-stride row)
-                               ^DenseArray m-data (.data m)
-                               ^doubles ddata (.data m-data)]
-                           (aget ddata (+ (.offset m-data) row-offset column))))
+  AbstractMatrix
+  (get-1d [m row] (.getRow m row))
+  (get-2d [m row column] (.get m row column))
   (get-nd [m indexes] (let [idx-count (count indexes)]
                         (case idx-count
                           1 (mp/get-1d m (first indexes))
@@ -236,32 +441,16 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
                           (throw (Exception. "Unsupported"))))))
 
 (extend-protocol mp/PIndexedSettingMutable
-  DenseArray
-  (set-1d! [m row v] (let [^DenseArray m m
-                           ^long row row
-                           ^double v v]
-                       (aset ^doubles (.data m) (+ (.offset m) row) v)))
+  AbstractVector
+  (set-1d! [m row v] (.set m row v))
   (set-2d! [m row column v] (throw (Exception. "Unsupported")))
   (set-nd [m indexes v]
     (case (count indexes)
       1 (mp/set-1d! m (first indexes) v)
       (throw (Exception. "Unsupported"))))
-  DenseMatrix
-  (set-1d! [m row v] (let [^DenseMatrix m m
-                           ^DenseArray data (.data m)
-                           ^DenseArray incoming v
-                           row-stride (.column-count m)]
-                       (System/arraycopy ^doubles (.data incoming)
-                                         (.offset incoming)
-                                         ^doubles (.data data)
-                                         (+ (.offset data) (* row-stride row))
-                                         row-stride)))
-  (set-2d! [m row column v] (let [^DenseMatrix m m
-                                  row-stride (.column-count m)
-                                  m-offset (+ ^long column (* row-stride row))
-                                  ^double v v
-                                  ^DenseArray data (.data m)]
-                              (aset ^doubles (.data data) (+ (.offset data) m-offset)) v))
+  AbstractMatrix
+  (set-1d! [m row v] (.setRow m row v))
+  (set-2d! [m row column v] (.set m row column v))
   (set-nd! [m indexes v]
     (case (count indexes)
       1 (mp/set-1d! m (first indexes) v)
@@ -270,15 +459,15 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
 
 
 (extend-protocol mp/PMatrixCloning
-  DenseArray
-  (clone [m] (deep-copy-array-view m))
-  DenseMatrix
-  (clone [m] (deep-copy-matrix-view m)))
+  AbstractVector
+  (clone [m] (.clone m))
+  AbstractMatrix
+  (clone [m] (.clone m)))
 
 
 (extend-protocol mp/PIndexedSetting
-  DenseArray
-  (set-1d [m row v] (let [retval (deep-copy-array-view m)]
+  AbstractVector
+  (set-1d [m row v] (let [retval (mp/clone m)]
                       (mp/set-1d retval row v)))
   (set-2d [m row column v] (throw (Exception. "Unsupported")))
   (set-nd [m indexes v]
@@ -287,10 +476,10 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
       (throw (Exception. "Unsupported"))))
   (is-mutable? [m] true)
 
-  DenseMatrix
-  (set-1d [m row v] (let [retval (deep-copy-matrix-view m)]
+  AbstractMatrix
+  (set-1d [m row v] (let [retval (mp/clone m)]
                       (mp/set-1d! retval row v)))
-  (set-2d [m row column v] (let [retval (deep-copy-matrix-view m)]
+  (set-2d [m row column v] (let [retval (mp/clone m)]
                              (mp/set-2d! retval row column v)))
   (set-nd [m indexes v]
     (case (count indexes)
@@ -301,85 +490,111 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
 
 
 (extend-protocol mp/PTypeInfo
-  DenseArray
-  (element-type [m] Double/TYPE)
-  DenseMatrix
+  NetlibItem
   (element-type [m] Double/TYPE))
 
 
 (extend-protocol mp/PValidateShape
-  DenseArray
-  (validate-shape [m] (let [^DenseArray m m
-                            ^doubles data (.data m)
-                            data-len (count data)
-                            item-end (+ (.length m) (.offset m))]
-                        (when (< (.offset m) 0)
-                          (throw (Exception. "Array offset is less than zero")))
-                        (when (> item-end data-len)
-                          (throw (Exception. "Array end is past end of array data")))
+  AbstractVector
+  (validate-shape [m] (let [^AbstractView v m]
+                        (validate-strided-view-shape (.getStridedView v))
                         [(.length m)]))
-  DenseMatrix
-  (validate-shape [m] (let [^DenseMatrix m m
-                            ^DenseArray data (.data m)
-                            ^doubles backing (.data data)
-                            data-len (count data)
-                            item-count (* (.row-count m) (.column-count m))
-                            item-end (+ item-count (.offset data))]
-                        (mp/validate-shape data)
-                        (when (> item-end data-len)
-                          (throw (Exception. "Matrix end is past end of data")))
-                        [(.row-count m) (.column-count m)])))
-
-
-;;TODO view or deep copy??
-(extend-protocol mp/PRowColMatrix
-  DenseArray
-  (column-matrix [m data] (let [^DenseArray m m]
-                            (->DenseMatrix m 1 (.length m))))
-  (row-matrix [m data] (let [^DenseArray m m]
-                         (->DenseMatrix m (.length m) 1))))
+  AbstractMatrix
+  (validate-shape [m] (let [^AbstractView v m]
+                        (validate-strided-view-shape (.getStridedView v))
+                        [(.rowCount m) (.columnCount m)])))
 
 
 (extend-protocol mp/PMutableMatrixConstruction
-  DenseArray
-  (mutable-matrix [m] (deep-copy-array-view m))
-  DenseMatrix
-  (mutable-matrix [m] (deep-copy-matrix-view m)))
+  AbstractVector
+  (mutable-matrix [m] (.clone ^AbstractVector m))
+  AbstractMatrix
+  (mutable-matrix [m] (.clone ^AbstractMatrix m)))
 
 
 (extend-protocol mp/PMutableCoercion
-  DenseArray
-  (ensure-mutable [m] m)
-  DenseMatrix
+  NetlibItem
   (ensure-mutable [m] m))
 
 
+(defn dense-coerce-vec
+  ^DenseVector [^AbstractVector item]
+  (.clone item))
+
+
+(defn dense-coerce-mat
+  ^DenseMatrix [^AbstractMatrix item]
+  (.clone item))
+
+
 (extend-protocol mp/PDense
-  DenseArray
-  (dense-coerce [m data] (new-array-view-from-data data))
-  (dense [m] true)
+  NetlibItem
+  (dense-coerce [m data] (new-dense-vector-from-data data))
+
+  DenseVector
+  (dense [m] m)
   DenseMatrix
-  (dense-coerce [m data] (new-array-view-from-data data))
-  (dense [m] true))
+  (dense [m] m)
+  AbstractView
+  (dense [m] (new-dense-vector-from-strided-view (.getStridedView ^AbstractView m))))
 
 
 (extend-protocol mp/PConversion
-  DenseArray
-  (convert-to-nested-vectors [m] (vec (.data ^DenseArray m)))
-  DenseMatrix
-  (convert-to-nested-vectors [m] (vec (.data ^DenseArray (.data ^DenseMatrix m)))))
+  AbstractVector
+  (convert-to-nested-vectors [m] (vec (seq m)))
+  AbstractMatrix
+  (convert-to-nested-vectors [m] (mapv mp/convert-to-nested-vectors (seq m))))
 
 
 (extend-protocol mp/PReshaping
-  DenseArray
-  (reshape [m shape] (let [^DenseArray m m
-                           num-desired (apply * shape)
-                           data-len (.length m)]
+  AbstractView
+  (reshape [m shape] (let [^DenseVector m (new-dense-vector-from-strided-view
+                                           (.getStridedView ^AbstractView m))
+                           num-desired (long (apply * shape))
+                           data-len (.length m)
+                           m (->DenseVector (.data m) 0 num-desired)]
+
                        (when (> num-desired data-len)
                          (throw (Exception. "Attempt to reshape to a larger backing storage")))
                        (case (count shape)
-                         1 (deep-copy-array-view m 0 num-desired)
-                         2 (->DenseMatrix (deep-copy-array-view m 0 num-desired) (first shape) (second shape))
-                         (throw (Exception. "Unsupported")))))
+                         1 m
+                         2 (->DenseMatrix m (first shape) (second shape))
+                         (throw (Exception. "Unsupported"))))))
+
+
+(extend-protocol mp/PPack
+  DenseVector
+  (pack [m] m)
   DenseMatrix
-  (reshape [m shape] (mp/reshape (.data ^DenseMatrix m) shape)))
+  (pack [m] m)
+  AbstractVector
+  (pack [m] (.clone ^AbstractVector m))
+  AbstractMatrix
+  (pack [m] (.clone ^AbstractMatrix m)))
+
+
+(extend-protocol PMatrixSlices
+  AbstractMatrix
+  (get-row [m i] (.getRow ^AbstractMatrix m i))
+  (get-column [m i] (get-column ^AbstractMatrix m i))
+  (get-major-slice [m i] (.getRow ^AbstractMatrix m i))
+  (get-slice [m dimension i]
+    (case (long dimension)
+      0 (mp/get-row m i)
+      1 (mp/get-column m i)
+      (throw (Exception. "Unsupported")))))
+
+
+(extend-protocol mp/PMatrixRows
+  AbstractMatrix
+  (get-rows [m] (seq m)))
+
+
+(extend-protocol mp/PMatrixColumns
+  AbstractMatrix
+  (get-columns [m] (map #(get-column m %) (range (.columnCount ^AbstractMatrix m)))))
+
+
+(extend-protocol mp/PSubVector
+  AbstractVector
+  (subvector [m start length]))
