@@ -16,12 +16,26 @@
 ;;  (+ offset (- column-count initial-column-count))
 ;;Furthermore initial-column-count and last-column-count
 ;;must be <= column-count
+;;a. If the view has 1 row, then last-column-count must be zero.
+;;b. (>= row-stride column-count)
+;;There is slight ambiguity because given last-column-count if there are
+;;any rows at all past the initial row you can add 1 to the row count
+;;and set last-column-count to 0 and have the same object meaning.
 (defrecord StridedView [^doubles data ^long offset ^long row-count ^long column-count
                         ^long row-stride ^long initial-column-count ^long last-column-count])
 
 (defn new-strided-view
   (^StridedView [data offset row-count column-count
                  row-stride initial-column-count last-column-count]
+   (when (and (= row-count 1)
+              (or
+               (not= 0 last-column-count)
+               (= 0 initial-column-count)))
+     (throw (Exception. "Invalid strided view format a.")))
+
+   (when (< row-stride column-count)
+     (throw (Exception. "Row stride is less than column count")))
+
    (->StridedView data offset row-count column-count
                   row-stride initial-column-count last-column-count))
 
@@ -29,6 +43,7 @@
    (->StridedView data offset row-count column-count row-stride column-count 0))
   (^StridedView [^doubles data ^long offset ^long row-count ^long column-count]
    (->StridedView data offset row-count column-count column-count column-count 0))
+
   (^StridedView [^doubles data ^long offset ^long length]
    (->StridedView data offset 1 length length length 0)))
 
@@ -332,6 +347,22 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
     (->StridedVector view)))
 
 
+(defn strided-view-to-matrix
+  "A strided view can be a matrix when it addresses a block of memory
+with the same number of columns in each row"
+  ^AbstractMatrix [^StridedView view ^long num-rows ^long num-cols]
+  (when-not (and (= (.column-count view) (.initial-column-count view))
+                 (or (= 0 (.last-column-count view))
+                     (= (.column-count view) (.last-column-count view))))
+    (throw (Exception. "Cannot make matrix out of offset view")))
+  (if (= (.column-count view) (.row-stride view))
+    (->DenseMatrix (->DenseVector (.data view) (.offset view)
+                                  (* num-rows num-cols))
+                   num-rows
+                   num-cols)
+    (->StridedMatrix view num-rows num-cols)))
+
+
 (defn set-column
   [^AbstractMatrix mat ^long column ^AbstractVector data]
   (let [^AbstractView col-view (get-column mat column)
@@ -596,5 +627,38 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
 
 
 (extend-protocol mp/PSubVector
-  AbstractVector
-  (subvector [m start length]))
+  AbstractView
+  (subvector [m start length]
+    (let [^AbstractView view m
+          ^StridedView data (.getStridedView view)]
+      (strided-view-to-vector (create-sub-strided-view view start length)))))
+
+
+(extend-protocol mp/PSubMatrix
+  AbstractMatrix
+  (submatrix [m dim-ranges]
+    (let [^AbstractMatrix m m
+          ^AbstractView mat-view m
+          ^StridedView view (.getStridedView mat-view)
+          num-dims (count dim-ranges)
+          num-data-items (get-strided-view-data-length view)]
+      (when-not (= 2 num-dims)
+        (throw (Exception. "Number of dim ranges must be 2")))
+      (when-not (and (= (.column-count view) (.initial-column-count view))
+                     (= 0 (rem num-data-items (.columnCount m))))
+        (throw (Exception. "Submatric views on offset matrixes are not supported")))
+      (let [[[start-row num-rows] [start-col num-cols]] dim-ranges
+            data-start-offset (+ (* (.columnCount m) start-row) start-col)]
+        (when (or (> (+ start-row num-rows)
+                     (.rowCount m))
+                  (> (+ start-col num-cols)
+                     (.columnCount m)))
+          (throw (Exception. "Attempt to access outside of matrix")))
+        (let [new-view (new-strided-view (.data view)
+                                         (get-strided-view-total-offset view data-start-offset)
+                                         num-rows
+                                         num-cols
+                                         (.row-stride view)
+                                         num-cols
+                                         0)]
+          (strided-view-to-matrix new-view num-rows num-cols))))))
