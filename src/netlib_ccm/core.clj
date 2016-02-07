@@ -55,7 +55,7 @@
   (when (< row-idx 0)
     (throw (Exception. "Attempt to access before beginning of view"))))
 
-(defn get-strided-view-column-count
+(defn get-strided-view-row-length-from-row
   ^long [^StridedView view, ^long row]
   (cond
     (= row 0) (.initial-column-count view)
@@ -75,6 +75,7 @@
   (when (>= data-offset (get-strided-view-data-length view))
     (throw (Exception. "Attempt to access past end of view"))))
 
+
 (defn get-strided-view-row-from-data-offset
   ^long [^StridedView view ^long data-offset]
   (check-strided-view-data-offset view data-offset)
@@ -82,6 +83,15 @@
     0
     (let [data-offset (- data-offset (.initial-column-count view))]
       (+ 1 (quot data-offset (.column-count view))))))
+
+
+(defn get-strided-view-data-offset-from-row
+  ^long [^StridedView view ^long row-idx]
+  (check-strided-view-row-index view row-idx)
+  (if (= 0 row-idx)
+    0
+    (+ (.initial-column-count view) (* (.column-count view) (- row-idx 1)))))
+
 
 (defn get-strided-view-row-length-from-data-offset
   ^long [^StridedView view ^long data-offset]
@@ -92,8 +102,8 @@
           row-idx (+ 1 (quot rest-offset (.column-count view)))
           rest-leftover (rem rest-offset (.column-count view))]
       (if (= row-idx (- (.row-count view) 1))
-        (- rest-leftover (.last-column-count view))
-        (- rest-leftover (.column-count view))))))
+        (- (.last-column-count view) rest-leftover)
+        (- (.column-count view) rest-leftover)))))
 
 
 (defn get-strided-view-total-offset
@@ -115,58 +125,97 @@
   (check-strided-view-data-offset view offset)
   (check-strided-view-data-offset view (+ offset (max 0 (- length 1))))
   (let [data-len (get-strided-view-data-length view)]
-    (let [start-submat-offset (- (get-strided-view-total-offset view offset) (.offset view))
-          ini-col-offset (rem start-submat-offset (.column-count view))
-          ini-col-len (- (.column-count view) ini-col-offset)
-          end-col-len (rem (- length ini-col-len) (.column-count view))
-          body-num-rows (/ (- length (+ ini-col-len end-col-len))
-                           (.row-stride view))
-          ini-row (long (if-not (= 0 ini-col-len) 1 0))
-          end-row (long (if-not (= 0 end-col-len) 1 0))]
-      (new-strided-view (.data view) (.offset view)
-                        (+ body-num-rows ini-row end-row)
-                        (.column-count view)
-                        (.row-stride view)
-                        ini-col-len
-                        end-col-len))))
+    (let [first-row-len (if (< offset (.initial-column-count view))
+                          (- (.initial-column-count view) offset)
+                          (- (.column-count view)
+                             (rem (- offset (.initial-column-count view))
+                                  (.column-count view))))
+          first-row-offset (- (.column-count view) first-row-len)]
+      (if (<= length first-row-len)
+        (new-strided-view (.data view) (.get-strided-view-total-offset view offset) length)
+        (let [row-idx (get-strided-view-row-from-data-offset view offset)
+              last-row-len (rem (+ first-row-offset length) (.column-count view))
+              ary-offset (+ (.offset view) (* (.row-stride view) row-idx))
+              body-num-rows (quot (- length (+ first-row-len last-row-len))
+                                  (.column-count view))
+              ini-row (long (if-not (= 0 first-row-len) 1 0))
+              end-row (long (if-not (= 0 last-row-len) 1 0))]
+          (println "row-idx" row-idx first-row-len first-row-offset last-row-len)
+          (new-strided-view (.data view) ary-offset
+                            (+ body-num-rows ini-row end-row)
+                            (.column-count view)
+                            (.row-stride view)
+                            first-row-len
+                            last-row-len))))))
 
 (defn strided-op
   "Perform an operation such as (assign! lhs rhs).
-Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amount"
-  [^StridedView lhs ^StridedView rhs op]
-  (loop [rhs-row 0]
-    (when (< rhs-row (.row-count rhs))
-      (let [data-offset (+ (* (.row-stride rhs) (max 0 (- (.row-count rhs) 2)))
-                           (.initial-column-count rhs))
-            rhs-row-len (get-strided-view-column-count rhs rhs-row)]
-       (loop [rhs-row-offset 0]
-         (when (< rhs-row-offset rhs-row-len)
-           (let [data-offset (+ data-offset rhs-row-offset)
-                 rhs-total-offset (get-strided-view-total-offset data-offset)
-                 rhs-row-len (- rhs-row-len rhs-row-offset)
-                 lhs-row (get-strided-view-row-from-data-offset lhs data-offset)
-                 lhs-row-len (get-strided-view-row-length-from-data-offset lhs data-offset)
-                 lhs-total-offset (get-strided-view-total-offset data-offset)
-                 op-amount (min lhs-row-len rhs-row-len)]
-             (op (.data lhs) lhs-total-offset
-                 (.data rhs) rhs-total-offset
-                 op-amount)
-             (recur (+ rhs-row-offset op-amount))))))
-      (recur (inc rhs-row)))))
+  Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amount"
+  ([^StridedView lhs ^StridedView rhs op]
+   (loop [rhs-row 0]
+     (when (< rhs-row (.row-count rhs))
+       (let [data-offset (get-strided-view-data-offset-from-row rhs rhs-row)
+             rhs-row-len (get-strided-view-row-length-from-row rhs rhs-row)]
+         (loop [rhs-row-offset 0]
+           (when (< rhs-row-offset rhs-row-len)
+             (let [data-offset (+ data-offset rhs-row-offset)
+                   rhs-total-offset (get-strided-view-total-offset rhs data-offset)
+                   rhs-row-len (- rhs-row-len rhs-row-offset)
+                   lhs-row (get-strided-view-row-from-data-offset lhs data-offset)
+                   lhs-row-len (get-strided-view-row-length-from-data-offset lhs data-offset)
+                   lhs-total-offset (get-strided-view-total-offset lhs data-offset)
+                   _ (println data-offset rhs-row-len lhs-row-len lhs-row rhs-row)
+                   op-amount (min lhs-row-len rhs-row-len)]
+               (op (.data lhs) lhs-total-offset
+                   (.data rhs) rhs-total-offset
+                   op-amount)
+               (recur (+ rhs-row-offset op-amount))))))
+       (recur (inc rhs-row)))))
+  ([^StridedView lhs op]
+   (loop [lhs-row 0]
+     (when (< lhs-row (.row-count lhs))
+       (let [row-len (get-strided-view-row-length-from-row lhs lhs-row)]
+         (when (> row-len 0)
+           (let [data-offset (get-strided-view-data-offset-from-row lhs lhs-row)
+                 lhs-total-offset (get-strided-view-total-offset lhs data-offset)]
+             (op (.data lhs) lhs-total-offset row-len))))
+       (recur (inc lhs-row))))))
+
 
 
 (defn assign-strided-view!
-  "lhs must be at least as large as rhs"
+  "lhs must be at least as large as rhs.  Rhs.length must be an even multiple
+of lhs.length"
   [^StridedView lhs ^StridedView rhs]
-  (strided-op lhs rhs (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
-                        (System/arraycopy ^doubles rhs-data ^long rhs-offset
-                                          ^doubles lhs-data ^long lhs-offset
-                                          ^long op-len))))
+  (let [lhs-len (get-strided-view-data-length lhs)
+        rhs-len (get-strided-view-data-length rhs)]
+    ;;no op
+    (when-not (= 0 rhs-len)
+     (when-not (= 0 (rem lhs-len rhs-len))
+       (throw (Exception. "Strided assignment: rhs-len not even multiple of lhs-len")))
+     (if (= 1 rhs-len)
+       (let [rhs-val (aget ^doubles (.data rhs) (get-strided-view-total-offset rhs 0))]
+         (strided-op lhs (fn [^doubles data ^long offset ^long len]
+                           (java.util.Arrays/fill data offset (+ offset len) rhs-val))))
+       (let [num-reps (quot lhs-len rhs-len)
+             copy-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
+                       (println lhs-offset rhs-offset op-len)
+                       (System/arraycopy ^doubles rhs-data ^long rhs-offset
+                                         ^doubles lhs-data ^long lhs-offset
+                                         ^long op-len))]
+         (if (= 1 num-reps)
+           (strided-op lhs rhs copy-op)
+           (loop [rep 0]
+             (when (< rep num-reps)
+               (strided-op (create-sub-strided-view lhs (* rep rhs-len) rhs-len)
+                           rhs copy-op)
+               (recur (inc rep))))))))))
+
 
 (defn clone-strided-view
   "Create a packed strided view from potentially non-dense view"
   ^StridedView [^StridedView source]
-  (let [num-items (* (.row-count source) (.column-count source))
+  (let [num-items (get-strided-view-data-length source)
         ^doubles data (make-array Double/TYPE num-items)
         retval (new-strided-view data 0 1 num-items num-items)]
     (assign-strided-view! retval source)
@@ -203,7 +252,49 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
   (^netlib_ccm.core.AbstractMatrix clone [])
   (validateShape []))
 
+(defn vector-iterator
+  [^AbstractVector vec]
+  (let [idx (atom 0)
+        len (.length vec)]
+    (reify java.util.Iterator
+      (hasNext [this] (< @idx len))
+      (next [this] (let [current @idx]
+                     (swap! idx inc)
+                     (.get vec current)))
+      (remove [this] (throw (Exception. "Unsupported"))))))
+
+(defn matrix-iterator
+  [^AbstractMatrix mat]
+  (let [idx (atom 0)
+        len (.rowCount mat)]
+    (reify java.util.Iterator
+      (hasNext [this] (< @idx len))
+      (next [this] (let [current @idx]
+                     (swap! idx inc)
+                     (.getRow mat current)))
+      (remove [this] (throw (Exception. "Unsupported"))))))
+
 (declare ->DenseVector ->DenseMatrix)
+
+(defn vec-to-persistent-vec
+  [^AbstractVector avec]
+  (vec (seq avec)))
+
+(defn mat-to-persistent-vec
+  [^AbstractMatrix amat]
+  (mapv (comp vec seq) amat))
+
+(defn print-vector
+  [^AbstractVector avec]
+  (if (< (.length avec) 1000)
+    (pr-str (vec-to-persistent-vec avec))
+    (format "<vector of length %d>" (.length avec))))
+
+(defn print-matrix
+  [^AbstractMatrix amat]
+  (if (< (* (.rowCount amat) (.columnCount amat)) 1000)
+    (clojure.string/trim (with-out-str (clojure.pprint/pprint (mat-to-persistent-vec amat))))
+    (format "<matrix of %dx%d>" (.rowCount amat) (.columnCount amat))))
 
 (deftype DenseVector [^doubles data ^long offset ^long length]
   netlib_ccm.core.NetlibItem
@@ -220,7 +311,13 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
   (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
 
   clojure.lang.Seqable
-  (seq [this] (map #(.get this %) (range length))))
+  (seq [this] (map #(.get this %) (range length)))
+
+  java.lang.Object
+  (toString [this] (print-vector this))
+
+  java.lang.Iterable
+  (iterator [this] (vector-iterator this)))
 
 
 (deftype DenseMatrix [^DenseVector data ^long row-count ^long column-count]
@@ -260,7 +357,13 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
      (->DenseMatrix ary row-count column-count)))
   (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
   clojure.lang.Seqable
-  (seq [this] (map #(.getRow this %) (range (.rowCount this)))))
+  (seq [this] (map #(.getRow this %) (range (.rowCount this))))
+
+  java.lang.Object
+  (toString [this] (print-matrix this))
+
+  java.lang.Iterable
+  (iterator [this] (matrix-iterator this)))
 
 (declare strided-view-to-vector)
 
@@ -295,12 +398,20 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
   (^long columnCount [this] column-count)
   (^netlib_ccm.core.AbstractMatrix clone [this]
    (let [retval (clone-strided-view (.getStridedView this))
-         ary (->DenseVector (.data retval) 0 (* (.row-count data) (.column-count data)))]
-     (->DenseMatrix ary (.row-count data) (.column-count data))))
+         item-count (* row-count column-count)
+         ary (->DenseVector (.data retval) 0 item-count)]
+     (->DenseMatrix ary row-count column-count)))
   (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
 
   clojure.lang.Seqable
-  (seq [this] (map #(.getRow this %) (range (.rowCount this)))))
+  (seq [this] (map #(.getRow this %) (range (.rowCount this))))
+
+  java.lang.Object
+  (toString [this] (print-matrix this))
+
+  java.lang.Iterable
+  (iterator [this] (matrix-iterator this))
+  )
 
 ;;Interpret a submatrix as an array
 (deftype StridedVector [^StridedView data]
@@ -315,7 +426,7 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
   (set [this ^long idx ^double val]
     (aset ^doubles (.data data) (get-strided-view-total-offset data idx) val))
 
-  (^long length [this] (* (.row-count data) (.column-count data)))
+  (^long length [this] (get-strided-view-data-length data))
 
   (^netlib_ccm.core.AbstractVector clone [this]
    (strided-view-to-vector (clone-strided-view (.getStridedView this))))
@@ -323,7 +434,13 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
   (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
 
   clojure.lang.Seqable
-  (seq [this] (map #(.get this %) (range (.length this)))))
+  (seq [this] (map #(.get this %) (range (.length this))))
+
+  java.lang.Object
+  (toString [this] (print-vector this))
+
+  java.lang.Iterable
+  (iterator [this] (matrix-iterator this)))
 
 
 (defn get-column
@@ -341,7 +458,10 @@ Op gets passed: lhs-double-array lhs-offset rhs-double-array rhs-offset op-amoun
 (defn strided-view-to-vector
   ^AbstractVector [^StridedView view]
   (if (or (= 1 (.row-count view))
-          (= (.row-stride view) (.column-count view)))
+          (and (= (.row-stride view) (.column-count view))
+               (= (.initial-column-count view) (.column-count view))
+               (or (= (.last-column-count view) (.column-count view))
+                   (= (.last-column-count view) 0))))
     (->DenseVector (.data view) (get-strided-view-total-offset view 0)
                    (get-strided-view-data-length view))
     (->StridedVector view)))
@@ -406,7 +526,7 @@ with the same number of columns in each row"
 
 (defn new-dense-vector-from-data
   ^DenseVector [data]
-  (new-array-view-from-array (double-array-from-data data)))
+  (new-dense-vector-from-array (double-array-from-data data)))
 
 (defn do-construct-matrix
   [data]
@@ -604,7 +724,7 @@ with the same number of columns in each row"
   (pack [m] (.clone ^AbstractMatrix m)))
 
 
-(extend-protocol PMatrixSlices
+(extend-protocol mp/PMatrixSlices
   AbstractMatrix
   (get-row [m i] (.getRow ^AbstractMatrix m i))
   (get-column [m i] (get-column ^AbstractMatrix m i))
@@ -631,7 +751,7 @@ with the same number of columns in each row"
   (subvector [m start length]
     (let [^AbstractView view m
           ^StridedView data (.getStridedView view)]
-      (strided-view-to-vector (create-sub-strided-view view start length)))))
+      (strided-view-to-vector (create-sub-strided-view data start length)))))
 
 
 (extend-protocol mp/PSubMatrix
@@ -654,11 +774,108 @@ with the same number of columns in each row"
                   (> (+ start-col num-cols)
                      (.columnCount m)))
           (throw (Exception. "Attempt to access outside of matrix")))
-        (let [new-view (new-strided-view (.data view)
+        (let [row-stride (if (= 1 (.row-count view))
+                           (.columnCount m)
+                           (.row-stride view))
+              new-view (new-strided-view (.data view)
                                          (get-strided-view-total-offset view data-start-offset)
-                                         num-rows
+                                         ;;Add one row to account for the 0 last-column-count
+                                         (+ num-rows 1)
                                          num-cols
-                                         (.row-stride view)
+                                         row-stride
                                          num-cols
                                          0)]
           (strided-view-to-matrix new-view num-rows num-cols))))))
+
+;;double dispatch on type of source
+(defprotocol PAbstractViewAssign
+  (assign-source-to-view! [source m]))
+
+
+(extend-protocol PAbstractViewAssign
+  (Class/forName "[D")
+  (assign-source-to-view! [source m]
+    (let [^doubles source source
+          ^AbstractView m m]
+      (assign-strided-view! (.getStridedView m)
+                            (new-strided-view source 0 (count source)))))
+
+  AbstractView
+  (assign-source-to-view! [source m]
+    (let [^AbstractView source source
+          ^AbstractView m m]
+      (assign-strided-view! (.getStridedView m) (.getStridedView source))))
+
+  clojure.lang.PersistentVector
+  (assign-source-to-view! [source m]
+    (let [^AbstractView m m
+          ^doubles ddata (double-array-from-data source)]
+      (assign-source-to-view! ddata m)))
+
+  clojure.lang.ISeq
+  (assign-source-to-view! [source m]
+    (let [^AbstractView m m
+          ^doubles ddata (double-array-from-data source)]
+      (assign-source-to-view! ddata m)))
+
+  Double
+  (assign-source-to-view! [source m]
+    (let [^double source source
+          ^AbstractView m m]
+      (strided-op (.getStridedView m)
+                  (fn [^doubles data ^long offset ^long len]
+                    (java.util.Arrays/fill data offset (+ offset len) source))))))
+
+
+(extend-protocol mp/PAssignment
+  AbstractView
+  (assign! [m source] (assign-source-to-view! source m))
+  (assign-array! [m arr] (mp/assign-array! m arr 0 (count arr)))
+  (assign-array! [m arr offset len]
+    (let [^AbstractView m m]
+      (assign-strided-view! (.getStridedView m)
+                            (new-strided-view arr offset len)))))
+
+
+(extend-protocol mp/PMutableFill
+  AbstractView
+  (fill! [m value] (assign-source-to-view! value m)))
+
+
+(defn is-strided-view-dense?
+  "A dense strided view is one that has no offset and completely
+fills its backing store"
+  [^StridedView view]
+  (and (= 0 (.offset view))
+       (= (.column-count view) (.row-stride view))
+       (= (.column-count view) (.initial-column-count view))
+       (or (= (.column-count view) (.last-column-count view))
+           (= 0 (.last-column-count view)))
+       (= (count (.data view))
+          (* (.row-count view) (.column-count view)))))
+
+
+(extend-protocol mp/PDoubleArrayOutput
+  AbstractView
+  (to-double-array [m]
+    (let [^AbstractView m m
+          ^StridedView view (.getStridedView m)]
+      (if (is-strided-view-dense? view)
+        (.data view)
+        (.data (clone-strided-view view)))))
+  (as-double-array [m]
+    (let [^AbstractView m m
+          ^StridedView view (.getStridedView m)]
+      (when (is-strided-view-dense? view)
+        (.data view)))))
+
+
+(extend-protocol mp/PVectorView
+  AbstractView
+  (as-vector [m]
+    (let [^AbstractView m m]
+      (strided-view-to-vector (.getStridedView m)))))
+
+
+(def empty-vec (new-dense-vector 0))
+(mi/register-implementation empty-vec)
