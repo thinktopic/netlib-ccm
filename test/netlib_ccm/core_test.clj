@@ -26,4 +26,6 @@
 
 (deftest basic-matrix
   (testing "creating and operating on a dense matrix"
-    (let [mat1 (m/array :netlib (partition 3 (range 1 10)))])))
+    (let [mat1 (m/array :netlib (partition 3 (range 1 10)))
+          submat (m/submatrix mat1 1 2 1 2)]
+      [mat1 submat])))

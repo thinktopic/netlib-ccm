@@ -132,7 +132,7 @@
                                   (.column-count view))))
           first-row-offset (- (.column-count view) first-row-len)]
       (if (<= length first-row-len)
-        (new-strided-view (.data view) (.get-strided-view-total-offset view offset) length)
+        (new-strided-view (.data view) (get-strided-view-total-offset view offset) length)
         (let [row-idx (get-strided-view-row-from-data-offset view offset)
               last-row-len (rem (+ first-row-offset length) (.column-count view))
               ary-offset (+ (.offset view) (* (.row-stride view) row-idx))
@@ -140,7 +140,6 @@
                                   (.column-count view))
               ini-row (long (if-not (= 0 first-row-len) 1 0))
               end-row (long (if-not (= 0 last-row-len) 1 0))]
-          (println "row-idx" row-idx first-row-len first-row-offset last-row-len)
           (new-strided-view (.data view) ary-offset
                             (+ body-num-rows ini-row end-row)
                             (.column-count view)
@@ -164,7 +163,6 @@
                    lhs-row (get-strided-view-row-from-data-offset lhs data-offset)
                    lhs-row-len (get-strided-view-row-length-from-data-offset lhs data-offset)
                    lhs-total-offset (get-strided-view-total-offset lhs data-offset)
-                   _ (println data-offset rhs-row-len lhs-row-len lhs-row rhs-row)
                    op-amount (min lhs-row-len rhs-row-len)]
                (op (.data lhs) lhs-total-offset
                    (.data rhs) rhs-total-offset
@@ -199,7 +197,6 @@ of lhs.length"
                            (java.util.Arrays/fill data offset (+ offset len) rhs-val))))
        (let [num-reps (quot lhs-len rhs-len)
              copy-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
-                       (println lhs-offset rhs-offset op-len)
                        (System/arraycopy ^doubles rhs-data ^long rhs-offset
                                          ^doubles lhs-data ^long lhs-offset
                                          ^long op-len))]
@@ -443,17 +440,38 @@ of lhs.length"
   (iterator [this] (matrix-iterator this)))
 
 
+(defn get-submatrix
+  [^AbstractMatrix m start-row num-rows start-col num-cols]
+  (let [^AbstractView mat-view m
+        ^StridedView view (.getStridedView mat-view)
+        num-data-items (get-strided-view-data-length view)]
+    (when-not (and (= (.column-count view) (.initial-column-count view))
+                   (= 0 (rem num-data-items (.columnCount m))))
+      (throw (Exception. "Submatric views on offset matrixes are not supported")))
+    (let [data-start-offset (+ (* (.columnCount m) start-row) start-col)]
+        (when (or (> (+ start-row num-rows)
+                     (.rowCount m))
+                  (> (+ start-col num-cols)
+                     (.columnCount m)))
+          (throw (Exception. "Attempt to access outside of matrix")))
+        (let [row-stride (if (= 1 (.row-count view))
+                           (.columnCount m)
+                           (.row-stride view))
+              new-view (new-strided-view (.data view)
+                                         (get-strided-view-total-offset view data-start-offset)
+                                         ;;Add one row to account for the 0 last-column-count
+                                         (+ num-rows 1)
+                                         num-cols
+                                         row-stride
+                                         num-cols
+                                         0)]
+          (strided-view-to-matrix new-view num-rows num-cols)))))
+
+
 (defn get-column
   ^StridedVector [^AbstractMatrix mat ^long column]
-  (let [^AbstractView mat mat
-        ^StridedView view (.getStridedView mat)]
-    (when-not (= (.column-count view) (.initial-column-count view))
-      (throw (Exception. "Unsupported")))
-    (->StridedVector (new-strided-view (.data view)
-                                      (+ (.offset view) column)
-                                      (.row-count view)
-                                      1
-                                      (.row-stride view)))))
+  (get-submatrix mat 0 (.rowCount mat) column 1))
+
 
 (defn strided-view-to-vector
   ^AbstractVector [^StridedView view]
@@ -757,35 +775,10 @@ with the same number of columns in each row"
 (extend-protocol mp/PSubMatrix
   AbstractMatrix
   (submatrix [m dim-ranges]
-    (let [^AbstractMatrix m m
-          ^AbstractView mat-view m
-          ^StridedView view (.getStridedView mat-view)
-          num-dims (count dim-ranges)
-          num-data-items (get-strided-view-data-length view)]
-      (when-not (= 2 num-dims)
-        (throw (Exception. "Number of dim ranges must be 2")))
-      (when-not (and (= (.column-count view) (.initial-column-count view))
-                     (= 0 (rem num-data-items (.columnCount m))))
-        (throw (Exception. "Submatric views on offset matrixes are not supported")))
-      (let [[[start-row num-rows] [start-col num-cols]] dim-ranges
-            data-start-offset (+ (* (.columnCount m) start-row) start-col)]
-        (when (or (> (+ start-row num-rows)
-                     (.rowCount m))
-                  (> (+ start-col num-cols)
-                     (.columnCount m)))
-          (throw (Exception. "Attempt to access outside of matrix")))
-        (let [row-stride (if (= 1 (.row-count view))
-                           (.columnCount m)
-                           (.row-stride view))
-              new-view (new-strided-view (.data view)
-                                         (get-strided-view-total-offset view data-start-offset)
-                                         ;;Add one row to account for the 0 last-column-count
-                                         (+ num-rows 1)
-                                         num-cols
-                                         row-stride
-                                         num-cols
-                                         0)]
-          (strided-view-to-matrix new-view num-rows num-cols))))))
+    (when-not (= 2 (count dim-ranges))
+      (throw (Exception. "Must have exactly 2 ranges for submatrx")))
+    (let [[start-row num-rows start-col num-cols] dim-ranges]
+      (get-submatrix m start-row num-rows start-col num-cols))))
 
 ;;double dispatch on type of source
 (defprotocol PAbstractViewAssign
