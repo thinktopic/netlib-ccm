@@ -139,7 +139,7 @@
               body-num-rows (quot (- length (+ first-row-len last-row-len))
                                   (.column-count view))
               ini-row (long (if-not (= 0 first-row-len) 1 0))
-              end-row (long (if-not (= 0 last-row-len) 1 0))]
+              end-row 1]
           (new-strided-view (.data view) ary-offset
                             (+ body-num-rows ini-row end-row)
                             (.column-count view)
@@ -439,6 +439,32 @@ of lhs.length"
   java.lang.Iterable
   (iterator [this] (matrix-iterator this)))
 
+(defn strided-view-to-vector
+  ^AbstractVector [^StridedView view]
+  (if (or (= 1 (.row-count view))
+          (and (= (.row-stride view) (.column-count view))
+               (= (.initial-column-count view) (.column-count view))
+               (or (= (.last-column-count view) (.column-count view))
+                   (= (.last-column-count view) 0))))
+    (->DenseVector (.data view) (get-strided-view-total-offset view 0)
+                   (get-strided-view-data-length view))
+    (->StridedVector view)))
+
+(defn strided-view-to-matrix
+  "A strided view can be a matrix when it addresses a block of memory
+with the same number of columns in each row"
+  ^AbstractMatrix [^StridedView view ^long num-rows ^long num-cols]
+  (when-not (and (= (.column-count view) (.initial-column-count view))
+                 (or (= 0 (.last-column-count view))
+                     (= (.column-count view) (.last-column-count view))))
+    (throw (Exception. "Cannot make matrix out of offset view")))
+  (if (= (.column-count view) (.row-stride view))
+    (->DenseMatrix (->DenseVector (.data view) (.offset view)
+                                  (* num-rows num-cols))
+                   num-rows
+                   num-cols)
+    (->StridedMatrix view num-rows num-cols)))
+
 
 (defn get-submatrix
   [^AbstractMatrix m start-row num-rows start-col num-cols]
@@ -470,35 +496,7 @@ of lhs.length"
 
 (defn get-column
   ^StridedVector [^AbstractMatrix mat ^long column]
-  (get-submatrix mat 0 (.rowCount mat) column 1))
-
-
-(defn strided-view-to-vector
-  ^AbstractVector [^StridedView view]
-  (if (or (= 1 (.row-count view))
-          (and (= (.row-stride view) (.column-count view))
-               (= (.initial-column-count view) (.column-count view))
-               (or (= (.last-column-count view) (.column-count view))
-                   (= (.last-column-count view) 0))))
-    (->DenseVector (.data view) (get-strided-view-total-offset view 0)
-                   (get-strided-view-data-length view))
-    (->StridedVector view)))
-
-
-(defn strided-view-to-matrix
-  "A strided view can be a matrix when it addresses a block of memory
-with the same number of columns in each row"
-  ^AbstractMatrix [^StridedView view ^long num-rows ^long num-cols]
-  (when-not (and (= (.column-count view) (.initial-column-count view))
-                 (or (= 0 (.last-column-count view))
-                     (= (.column-count view) (.last-column-count view))))
-    (throw (Exception. "Cannot make matrix out of offset view")))
-  (if (= (.column-count view) (.row-stride view))
-    (->DenseMatrix (->DenseVector (.data view) (.offset view)
-                                  (* num-rows num-cols))
-                   num-rows
-                   num-cols)
-    (->StridedMatrix view num-rows num-cols)))
+  (mp/as-vector (get-submatrix mat 0 (.rowCount mat) column 1)))
 
 
 (defn set-column
@@ -777,7 +775,7 @@ with the same number of columns in each row"
   (submatrix [m dim-ranges]
     (when-not (= 2 (count dim-ranges))
       (throw (Exception. "Must have exactly 2 ranges for submatrx")))
-    (let [[start-row num-rows start-col num-cols] dim-ranges]
+    (let [[[ start-row num-rows] [start-col num-cols]] dim-ranges]
       (get-submatrix m start-row num-rows start-col num-cols))))
 
 ;;double dispatch on type of source
