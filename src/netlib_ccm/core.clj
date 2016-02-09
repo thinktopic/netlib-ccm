@@ -2,7 +2,7 @@
   (:require [clojure.core.matrix :as ma]
             [clojure.core.matrix.protocols :as mp]
             [clojure.core.matrix.implementations :as mi]
-            [clojure.reflect :as r])
+            [clojure.core.matrix.impl.mathsops :as mops])
   (:import [com.github.fommil.netlib BLAS]))
 
 
@@ -180,11 +180,8 @@
        (recur (inc lhs-row))))))
 
 
-
-(defn assign-strided-view!
-  "lhs must be at least as large as rhs.  Rhs.length must be an even multiple
-of lhs.length"
-  [^StridedView lhs ^StridedView rhs]
+(defn strided-view-multiple-op!
+  [^StridedView lhs ^StridedView rhs multiple-val-op single-val-op]
   (let [lhs-len (get-strided-view-data-length lhs)
         rhs-len (get-strided-view-data-length rhs)]
     ;;no op
@@ -194,19 +191,28 @@ of lhs.length"
      (if (= 1 rhs-len)
        (let [rhs-val (aget ^doubles (.data rhs) (get-strided-view-total-offset rhs 0))]
          (strided-op lhs (fn [^doubles data ^long offset ^long len]
-                           (java.util.Arrays/fill data offset (+ offset len) rhs-val))))
-       (let [num-reps (quot lhs-len rhs-len)
-             copy-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
-                       (System/arraycopy ^doubles rhs-data ^long rhs-offset
-                                         ^doubles lhs-data ^long lhs-offset
-                                         ^long op-len))]
+                           (single-val-op data offset len rhs-val))))
+       (let [num-reps (quot lhs-len rhs-len)]
          (if (= 1 num-reps)
-           (strided-op lhs rhs copy-op)
+           (strided-op lhs rhs multiple-val-op)
            (loop [rep 0]
              (when (< rep num-reps)
                (strided-op (create-sub-strided-view lhs (* rep rhs-len) rhs-len)
-                           rhs copy-op)
+                           rhs multiple-val-op)
                (recur (inc rep))))))))))
+
+
+(defn assign-strided-view!
+  "lhs must be at least as large as rhs.  Lhs.length must be a multiple
+of Rhs.length"
+  [^StridedView lhs ^StridedView rhs]
+  (let [single-val-op (fn [^doubles data ^long offset ^long len ^double rhs-val]
+                        (java.util.Arrays/fill data offset (+ offset len) rhs-val))
+        multiple-val-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
+                          (System/arraycopy ^doubles rhs-data ^long rhs-offset
+                                            ^doubles lhs-data ^long lhs-offset
+                                            ^long op-len))]
+    (strided-view-multiple-op! lhs rhs single-val-op multiple-val-op)))
 
 
 (defn clone-strided-view
@@ -866,6 +872,85 @@ fills its backing store"
   (as-vector [m]
     (let [^AbstractView m m]
       (strided-view-to-vector (.getStridedView m)))))
+
+(defn clone-abstract-view
+  [^AbstractView view]
+  (if (instance? ^AbstractMatrix view)
+    (.clone ^AbstractMatrix view)
+    (.clone ^AbstractVector view)))
+
+
+(defn unary-op!
+  [^AbstractView view op]
+  (let [^StridedView view (.getStridedView view)]
+    (strided-op view (fn [^doubles data ^long offset ^long len]
+                       (loop [idx 0]
+                         (when (< idx len)
+                           (let [offset (+ offset idx)]
+                             (aset (op (aget data offset)) offset))
+                           (recur (inc idx))))))))
+
+
+;;All unary operators
+(defn unary-immutable-op
+  [^AbstractView view op]
+  (let [new-view (clone-abstract-view view)]
+    (unary-op! new-view op)
+    new-view))
+
+
+(defn binary-op!
+  "lhs gets (op lhs rhs)"
+  [^AbstractView lhs ^AbstractView rhs op]
+  (let [single-val-op (fn [^doubles data ^long offset ^long len ^double rhs-val]
+                        (loop [idx 0]
+                          (when (< idx len)
+                            (let [offset (+ offset idx)]
+                              (aset data offset (double (op (aget data offset) rhs-val))))
+                            (recur (inc idx)))))
+        multiple-val-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
+                          (loop [idx 0]
+                            (when (< idx op-len)
+                              (let [lhs-offset (+ lhs-offset idx)
+                                    rhs-offset (+ rhs-offset idx)
+                                    lhs-val (aget ^doubles lhs-data lhs-offset)
+                                    rhs-val (aget ^doubles rhs-data rhs-offset)]
+                                (aset ^doubles lhs-data lhs-offset (double (op lhs-val rhs-val))))
+                              (recur (inc idx)))))]
+    (strided-view-multiple-op! (.getStridedView lhs) (.getStridedView rhs) single-val-op multiple-val-op)))
+
+
+(defn binary-immutable-op
+  [^AbstractView lhs ^AbstractView rhs op]
+  (let [^AbstractView lhs-clone (clone-abstract-view lhs)]
+    (binary-op! lhs-clone rhs op)
+    lhs-clone))
+
+(defprotocol SourceViewOp
+  (source-view-op [source view op])
+  (source-view-op! [source view op]))
+
+(extend-protocol SourceViewOp
+  (Class/forName "[D")
+  (source-view-op [source view op]
+    (let [^AbstractView view view]
+      (binary-immutable-op view (->DenseVector source 0 (count source)))))
+  (source-view-op! [source view op]
+    (let [^AbstractView view view]
+      (binary-op! view (->DenseVector source 0 (count source)) op)))
+
+  AbstractView
+  (source-view-op [source view op] (binary-immutable-op view source op))
+  (source-view-op! [source view op] (binary-op! view source op))
+
+  Double
+  (source-view-op [source view op] (let [^AbstractView retval (clone-abstract-view view)]
+                                     (strided-op (.getStridedView retval) (partial op source))
+                                     retval))
+  (source-view-op! [source view op] (strided-op (.getStridedView ^AbstractView view) (partial op source))))
+
+
+
 
 
 (def empty-vec (new-dense-vector 0))
