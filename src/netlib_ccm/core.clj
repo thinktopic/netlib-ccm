@@ -839,7 +839,8 @@ with the same number of columns in each row"
     (let [^doubles source source
           ^AbstractView m m]
       (assign-strided-view! (.getStridedView m)
-                            (new-strided-view source 0 (count source)))))
+                            (new-strided-view source 0 (count source)))
+      m))
 
   AbstractView
   (assign-source-to-view! [source m]
@@ -853,13 +854,15 @@ with the same number of columns in each row"
   (assign-source-to-view! [source m]
     (let [^AbstractView m m
           ^doubles ddata (double-array-from-data source)]
-      (assign-source-to-view! ddata m)))
+      (assign-source-to-view! ddata m)
+      m))
 
   clojure.lang.ISeq
   (assign-source-to-view! [source m]
     (let [^AbstractView m m
           ^doubles ddata (double-array-from-data source)]
-      (assign-source-to-view! ddata m)))
+      (assign-source-to-view! ddata m)
+      m))
 
   Double
   (assign-source-to-view! [source m]
@@ -867,7 +870,8 @@ with the same number of columns in each row"
           ^AbstractView m m]
       (strided-op (.getStridedView m)
                   (fn [^doubles data ^long offset ^long len]
-                    (java.util.Arrays/fill data offset (+ offset len) source))))))
+                    (java.util.Arrays/fill data offset (+ offset len) source)))
+      m)))
 
 
 (extend-protocol mp/PAssignment
@@ -1089,7 +1093,8 @@ with the same number of columns in each row"
                           (.daxpy (BLAS/getInstance) op-len factor
                                   ^doubles rhs-data rhs-offset
                                   ^doubles lhs-data lhs-offset)))))
-        (ma/add! m (ma/mul a factor))))))
+        (ma/add! m (ma/mul a factor)))
+      m)))
 
 (extend-protocol mp/PAddScaled
   AbstractView
@@ -1164,8 +1169,33 @@ with the same number of columns in each row"
   (or (instance? AbstractMatrix item)
       (instance? AbstractVector item)))
 
+(defn is-strided-view-data-in-range?
+  "Assuming these items share a buffer and have nonzero length,
+return true if they overlap"
+  [^StridedView lhs ^StridedView rhs]
+  (let [lhs-start (get-strided-view-total-offset lhs 0)
+        rhs-start (get-strided-view-total-offset rhs 0)
+        lhs-end (get-strided-view-total-offset lhs (- (get-strided-view-data-length lhs) 1))
+        rhs-end (get-strided-view-total-offset rhs (- (get-strided-view-data-length rhs) 1))]
+    (or (and (>= rhs-start lhs-start)
+             (<= rhs-start lhs-end))
+        (and (>= lhs-start rhs-start)
+             (<= lhs-start rhs-end)))))
 
-;;TODO dger for outer-product
+
+;;Also, blas doesn't like overlapping read/write memory
+(defn are-strided-views-overlapping?
+  [^StridedView lhs ^StridedView rhs]
+  (and (identical? (.data lhs) (.data rhs))
+       (and (> (get-strided-view-data-length lhs) 0)
+            (> (get-strided-view-data-length rhs) 0))
+       (is-strided-view-data-in-range? lhs rhs)))
+
+
+(defn are-abstract-views-overlapping?
+  [^AbstractView lhs ^AbstractView rhs]
+  (are-strided-views-overlapping? (.getStridedView lhs) (.getStridedView rhs)))
+
 
 (defn blas-gemm!
   "Defaults to a being a row-matrix if a vector and b being a column-matrix if a vector"
@@ -1177,15 +1207,21 @@ with the same number of columns in each row"
         beta (double beta)
         ^DenseMatrix a (make-dense-matrix a :row)
         ^DenseMatrix b (make-dense-matrix b :column)
+        ^AbstractView c c
         M (.rowCount a)
         N (.columnCount b)
         K (.rowCount b)
-        ;;M is a MxN matrix.
+        overlapping? (or (are-abstract-views-overlapping? a c)
+                         (are-abstract-views-overlapping? b c))
+        dest (if overlapping?
+               (clone-abstract-view c)
+               c)
+        ;;C is a MxN matrix.
         ^DenseMatrix m (cond
-                         (= 1 M) (make-dense-matrix c :row)
-                         (= 1 N) (make-dense-matrix c :column)
+                         (= 1 M) (make-dense-matrix dest :row)
+                         (= 1 N) (make-dense-matrix dest :column)
                          :else
-                         (make-dense-matrix c))
+                         (make-dense-matrix dest))
         ^DenseVector a-data (.data a)
         ^DenseVector b-data (.data b)
         ^DenseVector m-data (.data m)]
@@ -1201,8 +1237,7 @@ with the same number of columns in each row"
             (.data a-data) (.offset a-data) (.columnCount a)
             beta
             (.data m-data) (.offset m-data) (.columnCount m))
-    (assign-source-to-view! m c)
-    c)
+    (assign-source-to-view! m c))
   )
 
 ;;General protocol for things of the shape:
@@ -1282,39 +1317,71 @@ with the same number of columns in each row"
                       (fn [v] (mp/pre-scale a v))))))
 
 
+  ;;took a bit to find this one...
+(defn blas-element-multiply!
+  "y = alpha * (elem-mul a x) + b*y"
+  [alpha a x beta y]
+  (let [^DenseVector a (make-dense-vector a)
+        ^DenseVector x (make-dense-vector x)
+        ^AbstractView y y
+        overlapping? (or (are-strided-views-overlapping? (.getStridedView a)
+                                                          (.getStridedView y))
+                         (are-strided-views-overlapping? (.getStridedView x)
+                                                         (.getStridedView y)))
+        dest (if overlapping?
+               (clone-abstract-view y)
+               y)
+        ^DenseVector yd (make-dense-vector dest)
+        alpha (double alpha)
+        beta (double beta)]
+    ;(println a x y dest yd)
+    (when-not (and (= (.length a) (.length x))
+                   (= (.length a) (.length yd)))
+      (throw (Exception. "Element multiple of different length vectors unsupported")))
+    (.dsbmv (BLAS/getInstance) "U" (.length a) 0
+            alpha (.data a) (.offset a) 1
+            (.data x) (.offset x) 1
+            beta (.data yd) (.offset yd) 1)
+    (assign-source-to-view! yd y)
+    y))
 
-(defmulti typed-element-multiply! (fn [m a]
+
+
+(defmulti typed-element-multiply! (fn [m a result alpha beta]
                                     [(get-arg-mat-type m)
                                      (get-arg-mat-type a)]))
 
 (defmethod typed-element-multiply! [:matrix :matrix]
-  [m a]
-  (when-not (= (ma/shape m) (ma/shape a))
-    (throw (Exception. "Unsupported")))
-  (doall (map (fn [lhs-row rhs-row]
-                (typed-element-multiply! lhs-row rhs-row))
-              m a))
-  m)
+  [m a result alpha beta]
+  (blas-element-multiply! alpha m a beta result))
 
 (defmethod typed-element-multiply! [:matrix :vector]
-  [m a]
-  (doall (map (fn [lhs-row]
-                (typed-element-multiply! lhs-row a))
-              m a))
-  m)
+  [m a result alpha beta]
+  (doall (map (fn [m-row res-row]
+                (blas-element-multiply! alpha m-row a beta res-row))
+              m
+              result))
+  result)
 
 
 (defmethod typed-element-multiply! [:vector :vector]
-  [^AbstractVector a ^AbstractVector b]
-  (let [a-mat (make-dense-matrix a :column)
-        b-mat (make-dense-matrix b :row)]
-    (blas-gemm! 1.0 a-mat b-mat 0.0 a)))
+  [a b result alpha beta]
+  (blas-element-multiply! alpha b a beta result))
 
 
 (defmethod typed-element-multiply! [:vector :matrix]
-  [^AbstractVector a ^AbstractVector b]
-  (typed-element-multiply! a (make-dense-vector b)))
+  [a b result alpha beta]
+  (typed-element-multiply! b a result alpha beta))
 
+
+(defn clone-larger-view
+  [a b]
+  (let [view-a (.getStridedView ^AbstractView a)
+        view-b (.getStridedView ^AbstractView b)]
+    (if (> (get-strided-view-data-length view-a)
+           (get-strided-view-data-length view-b))
+      (clone-abstract-view a)
+      (clone-abstract-view b))))
 
 
 (extend-protocol mp/PMatrixMultiplyMutable
@@ -1322,13 +1389,44 @@ with the same number of columns in each row"
   (matrix-multiply! [m a]
     (if (ma/scalar? a)
       (ma/scale! m a)
-      (blas-gemm! 1.0 m a 0.0 m)))
+      (assign-source-to-view! (mp/inner-product m a) m)))
 
   (element-multiply! [m a]
     (if (ma/scalar? a)
       (ma/scale! m a)
-      (do (typed-element-multiply! m a) m))))
+      (assign-source-to-view! (typed-element-multiply! m a (clone-abstract-view m)
+                                                       1.0 0.0)
+                              m))))
 
+
+(extend-protocol mp/PMatrixMultiply
+  AbstractView
+  (matrix-multiply [m a]
+    (if (ma/scalar? a)
+      (ma/scale m a)
+      (mp/inner-product m a)))
+
+  (element-multiply [m a]
+    (if (ma/scalar? a)
+      (ma/scale! m a)
+      (typed-element-multiply! m a (clone-larger-view m a) 1.0 0.0))))
+
+
+(extend-protocol mp/PAddScaledProductMutable
+  AbstractView
+  (add-scaled-product! [m a b factor]
+    (if (or (ma/scalar? a) (ma/scalar? b))
+      (let [scalar-a? (ma/scalar? a)
+            a (if scalar-a? b a)
+            b (if scalar-a? a b)]
+        (mp/add-scaled! m a (* factor b)))
+      (typed-element-multiply! a b m factor 1.0))))
+
+
+(extend-protocol mp/PAddScaledProduct
+  AbstractView
+  (add-scaled-product [m a b factor]
+    (mp/add-scaled-product! (clone-abstract-view m) a b factor)))
 
 
 (def empty-vec (new-dense-vector 0))
