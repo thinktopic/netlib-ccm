@@ -2,7 +2,8 @@
   (:require [clojure.core.matrix :as ma]
             [clojure.core.matrix.protocols :as mp]
             [clojure.core.matrix.implementations :as mi]
-            [clojure.core.matrix.impl.mathsops :as mops])
+            [clojure.core.matrix.impl.mathsops :as mops]
+            [clojure.pprint])
   (:import [com.github.fommil.netlib BLAS]))
 
 
