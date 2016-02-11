@@ -232,19 +232,34 @@ and has no offset meaning it is accurately and completely represented by
                (recur (inc rep))))))))))
 
 
+(defn strided-view-reference-same-data?
+  [^StridedView lhs ^StridedView rhs]
+  (or (identical? lhs rhs)
+      (and (identical? (.data lhs) (.data rhs))
+           (= (get-strided-view-data-length lhs)
+              (get-strided-view-data-length rhs))
+           (or (and (is-strided-view-dense? lhs)
+                    (is-strided-view-dense? rhs))
+               (= 0 (get-strided-view-data-length lhs))
+               (and (= (.row-stride lhs) (.row-stride rhs))
+                    (= (get-strided-view-total-offset lhs 0)
+                       (get-strided-view-total-offset rhs 0)))))))
+
+
 (defn assign-strided-view!
   "lhs must be at least as large as rhs.  Lhs.length must be a multiple
 of Rhs.length"
   [^StridedView lhs ^StridedView rhs]
-  (when (and (> (get-strided-view-data-length lhs) 0)
-             (> (get-strided-view-data-length rhs) 0))
-    (let [single-val-op (fn [^doubles data ^long offset ^long len ^double rhs-val]
-                          (java.util.Arrays/fill data offset (+ offset len) rhs-val))
-          multiple-val-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
-                            (.dcopy (BLAS/getInstance) (int op-len)
-                                    ^doubles rhs-data (int lhs-offset) 1
-                                    ^doubles lhs-data (int rhs-offset) 1))]
-      (strided-view-multiple-op! lhs rhs multiple-val-op single-val-op))))
+  (when-not (strided-view-reference-same-data? lhs rhs)
+    (when (and (> (get-strided-view-data-length lhs) 0)
+               (> (get-strided-view-data-length rhs) 0))
+      (let [single-val-op (fn [^doubles data ^long offset ^long len ^double rhs-val]
+                            (java.util.Arrays/fill data offset (+ offset len) rhs-val))
+            multiple-val-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
+                              (.dcopy (BLAS/getInstance) (int op-len)
+                                      ^doubles rhs-data (int lhs-offset) 1
+                                      ^doubles lhs-data (int rhs-offset) 1))]
+        (strided-view-multiple-op! lhs rhs multiple-val-op single-val-op)))))
 
 
 (defn clone-strided-view
@@ -830,7 +845,9 @@ with the same number of columns in each row"
   (assign-source-to-view! [source m]
     (let [^AbstractView source source
           ^AbstractView m m]
-      (assign-strided-view! (.getStridedView m) (.getStridedView source))))
+      (when-not (identical? source m)
+        (assign-strided-view! (.getStridedView m) (.getStridedView source)))
+      m))
 
   clojure.lang.PersistentVector
   (assign-source-to-view! [source m]
@@ -1102,63 +1119,215 @@ with the same number of columns in each row"
   (scale [m constant] (mp/scale! (clone-abstract-view m) constant))
   (pre-scale [m constant] (mp/scale! (clone-abstract-view m) constant)))
 
-(defn make-dense-matrix
-  ^DenseMatrix [^AbstractMatrix m]
-  (if (instance? DenseMatrix m)
+
+(defn make-dense-vector
+  ^DenseVector [^AbstractView m]
+  (if (instance? DenseVector m)
     m
     (let [^StridedView data-view (.getStridedView ^AbstractView m)]
       (if (is-strided-view-dense? data-view)
-        (->DenseMatrix (->DenseVector (.data data-view) (get-strided-view-total-offset data-view 0)
-                                     (get-strided-view-data-length data-view))
-                       (.rowCount m)
-                       (.columnCount m))
-        ;;probably less expensive than operating on non-dense data
-        (.clone m)))))
+        (->DenseVector (.data data-view) (get-strided-view-total-offset data-view 0)
+                       (get-strided-view-data-length data-view))
+        (let [new-view (clone-strided-view data-view)]
+          (->DenseVector (.data new-view) 0 (get-strided-view-data-length new-view)))))))
+
+
+(defn make-dense-matrix
+  (^DenseMatrix [^AbstractMatrix m]
+   (if (instance? DenseMatrix m)
+     m
+     (let [^StridedView data-view (.getStridedView ^AbstractView m)]
+       (if (is-strided-view-dense? data-view)
+         (->DenseMatrix (->DenseVector (.data data-view) (get-strided-view-total-offset data-view 0)
+                                       (get-strided-view-data-length data-view))
+                        (.rowCount m)
+                        (.columnCount m))
+         ;;probably less expensive than operating on non-dense data
+         (.clone m)))))
+
+  (^DenseMatrix [m vector-to-matrix-conversion]
+   (if (instance? AbstractMatrix m)
+     (make-dense-matrix m)
+     (let [^DenseVector vec (make-dense-vector m)
+           vec-len (.length vec)
+           column-count (if (= :row vector-to-matrix-conversion)
+                          vec-len
+                          1)
+           row-count (if (= :row vector-to-matrix-conversion)
+                       1
+                       vec-len)]
+       (->DenseMatrix vec row-count column-count)))))
+
+
+(defn matrix-or-vector?
+  [item]
+  (or (instance? AbstractMatrix item)
+      (instance? AbstractVector item)))
 
 
 ;;TODO dger for outer-product
+
+(defn blas-gemm!
+  "Defaults to a being a row-matrix if a vector and b being a column-matrix if a vector"
+  [alpha a b beta c]
+  (when-not (and (matrix-or-vector? a)
+                 (matrix-or-vector? b))
+    (throw (Exception. "Unsupported")))
+  (let [factor (double alpha)
+        beta (double beta)
+        ^DenseMatrix a (make-dense-matrix a :row)
+        ^DenseMatrix b (make-dense-matrix b :column)
+        M (.rowCount a)
+        N (.columnCount b)
+        K (.rowCount b)
+        ;;M is a MxN matrix.
+        ^DenseMatrix m (cond
+                         (= 1 M) (make-dense-matrix c :row)
+                         (= 1 N) (make-dense-matrix c :column)
+                         :else
+                         (make-dense-matrix c))
+        ^DenseVector a-data (.data a)
+        ^DenseVector b-data (.data b)
+        ^DenseVector m-data (.data m)]
+    (when-not (and (= K (.columnCount a))
+                   (= M (.rowCount m))
+                   (= N (.columnCount m)))
+      (throw (Exception. (format "Incompatible matrix sizes: a %s b %s m %s"
+                                 (str (ma/shape a))
+                                 (str (ma/shape b))
+                                 (str (ma/shape m))))))
+    (.dgemm (BLAS/getInstance) "n" "n" N M K alpha
+            (.data b-data) (.offset b-data) (.columnCount b)
+            (.data a-data) (.offset a-data) (.columnCount a)
+            beta
+            (.data m-data) (.offset m-data) (.columnCount m))
+    (assign-source-to-view! m c)
+    c)
+  )
+
+;;General protocol for things of the shape:
+;;c = alpha*A*b + beta*c
+;;if c is a vector then we know that b is a vector
+;;if c is a matrix, then we know that b is a matrix
+;;A must always be a matrix
 (extend-protocol mp/PAddInnerProductMutable
-  AbstractMatrix
+  AbstractView
   (add-inner-product! [m a b] (mp/add-inner-product! m a b 1.0))
   (add-inner-product! [m a b factor]
-    (when-not (and (instance? AbstractMatrix a)
-                   (instance? AbstractMatrix b))
-      (throw (Exception. "Unsupported")))
-    (let [^DenseMatrix m m
-          factor (double factor)
-          ^DenseMatrix a (make-dense-matrix a)
-          ^DenseMatrix b (make-dense-matrix b)
-          M (.rowCount a)
-          N (.columnCount b)
-          K (.rowCount b)
-          ^DenseVector a-data (.data a)
-          ^DenseVector b-data (.data b)
-          ^DenseVector m-data (.data m)]
-      (when-not (and (= K (.columnCount a))
-                     (= M (.rowCount m))
-                     (= N (.columnCount m)))
-        (throw (Exception. (format "Incompatible matrix sizes: a %s b %s m %s"
-                                   (str (ma/shape a))
-                                   (str (ma/shape b))
-                                   (str (ma/shape m))))))
-      (.dgemm (BLAS/getInstance) "N" "N" M N K factor
-              (.data a-data) (.offset a-data) (.rowCount a)
-              (.data b-data) (.offset b-data) (.rowCount b)
-              1.0
-              (.data m-data) (.offset m-data) (.rowCount m)))))
+    (blas-gemm! factor a b 1.0 m)))
+
+
+(defn get-arg-mat-type
+  [item]
+  (cond
+    (instance? AbstractMatrix item) :matrix
+    (instance? AbstractVector item) :vector
+    (instance? Double/TYPE item) :double
+    :else
+    (throw (Exception. "Unsupported"))))
+
+(defmulti typed-inner-product (fn [a b]
+                                [(get-arg-mat-type a)
+                                 (get-arg-mat-type b)]))
+
+(defmethod typed-inner-product [:matrix :vector]
+  [a b]
+  (let [^AbstractVector b b
+        result (new-dense-vector (.length b))]
+    (mp/add-inner-product! result a b 1.0)
+    result))
+
+(defmethod typed-inner-product [:matrix :scalar]
+  [a b]
+  (ma/scale a b))
+
+
+(defmethod typed-inner-product [:matrix :matrix]
+  [a b]
+  (let [^AbstractMatrix a a
+        ^AbstractMatrix b b
+        result-rows (.rowCount a)
+        result-cols (.columnCount b)
+        result  (->DenseMatrix (new-dense-vector (* result-rows result-cols))
+                               result-rows result-cols)]
+    (mp/add-inner-product! result a b 1.0)
+    result))
+
+(defmethod typed-inner-product [:vector :vector]
+  [a b]
+  (ma/dot a b))
+
+(defmethod typed-inner-product [:vector :matrix]
+  [a b]
+  (let [^AbstractVector a a
+        result (new-dense-vector (.length a))]
+    (mp/add-inner-product! result a b 1.0)
+    result))
+
+(defmethod typed-inner-product [:vector :scalar]
+  [a b]
+  (ma/scale a b))
 
 
 (extend-protocol mp/PMatrixProducts
-  AbstractMatrix
-  (inner-product [m a]
-    (if (instance? AbstractMatrix a)
-      (let [^DenseMatrix ma (make-dense-matrix a)
-            ^DenseMatrix result (->DenseMatrix (new-dense-vector (* (.row-count ma) (.column-count ma)))
-                                               (.row-count ma) (.column-count ma))]
-        (mp/add-inner-product! result a m 1.0)
-        result)
-      (throw (Exception. "Unsupported"))))
-  (outer-product [m a] (throw (Exception. "Unsupported"))))
+  AbstractView
+  ;;If these are both vectors, then this turns into dotproduct.
+  (inner-product [a b]
+    (typed-inner-product a b))
+
+  (outer-product [m a]
+    (if (mp/is-scalar? m)
+      (mp/pre-scale a m)
+      (mp/element-map (mp/convert-to-nested-vectors m)
+                      (fn [v] (mp/pre-scale a v))))))
+
+
+
+(defmulti typed-element-multiply! (fn [m a]
+                                    [(get-arg-mat-type m)
+                                     (get-arg-mat-type a)]))
+
+(defmethod typed-element-multiply! [:matrix :matrix]
+  [m a]
+  (when-not (= (ma/shape m) (ma/shape a))
+    (throw (Exception. "Unsupported")))
+  (doall (map (fn [lhs-row rhs-row]
+                (typed-element-multiply! lhs-row rhs-row))
+              m a))
+  m)
+
+(defmethod typed-element-multiply! [:matrix :vector]
+  [m a]
+  (doall (map (fn [lhs-row]
+                (typed-element-multiply! lhs-row a))
+              m a))
+  m)
+
+
+(defmethod typed-element-multiply! [:vector :vector]
+  [^AbstractVector a ^AbstractVector b]
+  (let [a-mat (make-dense-matrix a :column)
+        b-mat (make-dense-matrix b :row)]
+    (blas-gemm! 1.0 a-mat b-mat 0.0 a)))
+
+
+(defmethod typed-element-multiply! [:vector :matrix]
+  [^AbstractVector a ^AbstractVector b]
+  (typed-element-multiply! a (make-dense-vector b)))
+
+
+
+(extend-protocol mp/PMatrixMultiplyMutable
+  AbstractView
+  (matrix-multiply! [m a]
+    (if (ma/scalar? a)
+      (ma/scale! m a)
+      (blas-gemm! 1.0 m a 0.0 m)))
+
+  (element-multiply! [m a]
+    (if (ma/scalar? a)
+      (ma/scale! m a)
+      (do (typed-element-multiply! m a) m))))
 
 
 
