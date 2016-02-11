@@ -109,44 +109,53 @@
 
 (defn get-strided-view-total-offset
   ^long [^StridedView view ^long data-offset]
-  (check-strided-view-data-offset view data-offset)
-  (let [data-len (get-strided-view-data-length view)
-        body-len (* (.column-count view) (max 0 (- (.row-count view) 2)))]
-    (if (< data-offset (.initial-column-count view))
-      (+ (+ (.offset view) (- (.column-count view) (.initial-column-count view)))
-         data-offset)
-      (let [data-rest (- data-offset (.initial-column-count view))]
-        (+ (.offset view)
-           (* (.row-stride view) (+ 1 (quot data-rest (.column-count view))))
-           (rem data-rest (.column-count view)))))))
+  ;;special case 0 so that everyone that wants to get an offset for pos 0
+  ;;doesn't have to check if it is within length of the vector
+  (if (= 0 data-offset)
+    (+ (.offset view) (max 0 (- (.column-count view) (.initial-column-count view))))
+    (do
+      (check-strided-view-data-offset view data-offset)
+      (let [data-len (get-strided-view-data-length view)
+            body-len (* (.column-count view) (max 0 (- (.row-count view) 2)))]
+        (if (< data-offset (.initial-column-count view))
+          (+ (+ (.offset view) (- (.column-count view) (.initial-column-count view)))
+             data-offset)
+          (let [data-rest (- data-offset (.initial-column-count view))]
+            (+ (.offset view)
+               (* (.row-stride view) (+ 1 (quot data-rest (.column-count view))))
+               (rem data-rest (.column-count view)))))))))
 
 
 (defn create-sub-strided-view
   [^StridedView view ^long offset ^long length]
-  (check-strided-view-data-offset view offset)
-  (check-strided-view-data-offset view (+ offset (max 0 (- length 1))))
-  (let [data-len (get-strided-view-data-length view)]
-    (let [first-row-len (if (< offset (.initial-column-count view))
-                          (- (.initial-column-count view) offset)
-                          (- (.column-count view)
-                             (rem (- offset (.initial-column-count view))
-                                  (.column-count view))))
-          first-row-offset (- (.column-count view) first-row-len)]
-      (if (<= length first-row-len)
-        (new-strided-view (.data view) (get-strided-view-total-offset view offset) length)
-        (let [row-idx (get-strided-view-row-from-data-offset view offset)
-              last-row-len (rem (+ first-row-offset length) (.column-count view))
-              ary-offset (+ (.offset view) (* (.row-stride view) row-idx))
-              body-num-rows (quot (- length (+ first-row-len last-row-len))
-                                  (.column-count view))
-              ini-row (long (if-not (= 0 first-row-len) 1 0))
-              end-row 1]
-          (new-strided-view (.data view) ary-offset
-                            (+ body-num-rows ini-row end-row)
-                            (.column-count view)
-                            (.row-stride view)
-                            first-row-len
-                            last-row-len))))))
+  ;;special case for (= 0 length)
+  (if (= 0 length)
+    (new-strided-view (.data view) (get-strided-view-total-offset view 0) 0)
+    (do
+      (check-strided-view-data-offset view offset)
+      (check-strided-view-data-offset view (+ offset (max 0 (- length 1))))
+      (let [data-len (get-strided-view-data-length view)]
+        (let [first-row-len (if (< offset (.initial-column-count view))
+                              (- (.initial-column-count view) offset)
+                              (- (.column-count view)
+                                 (rem (- offset (.initial-column-count view))
+                                      (.column-count view))))
+              first-row-offset (- (.column-count view) first-row-len)]
+          (if (<= length first-row-len)
+            (new-strided-view (.data view) (get-strided-view-total-offset view offset) length)
+            (let [row-idx (get-strided-view-row-from-data-offset view offset)
+                  last-row-len (rem (+ first-row-offset length) (.column-count view))
+                  ary-offset (+ (.offset view) (* (.row-stride view) row-idx))
+                  body-num-rows (quot (- length (+ first-row-len last-row-len))
+                                      (.column-count view))
+                  ini-row (long (if-not (= 0 first-row-len) 1 0))
+                  end-row 1]
+              (new-strided-view (.data view) ary-offset
+                                (+ body-num-rows ini-row end-row)
+                                (.column-count view)
+                                (.row-stride view)
+                                first-row-len
+                                last-row-len))))))))
 
 (defn is-strided-view-dense?
   "A dense strided view is one has no gaps in its data"
@@ -1015,10 +1024,9 @@ with the same number of columns in each row"
 
   Number
   (source-view-op [source view op] (let [^AbstractView retval (clone-abstract-view view)]
-                                     (strided-op (.getStridedView retval) (partial op (double source)))
+                                     (unary-op! retval #(op % (double source)))
                                      retval))
-  (source-view-op! [source view op] (strided-op (.getStridedView ^AbstractView view)
-                                                (partial op (double source)))))
+  (source-view-op! [source view op] (unary-op! view #(op % (double source)))))
 
 
 (extend-protocol mp/PFunctionalOperations
@@ -1301,8 +1309,9 @@ return true if they overlap"
 
 (defmethod typed-inner-product [:matrix :vector]
   [a b]
-  (let [^AbstractVector b b
-        result (new-dense-vector (.length b))]
+  (let [^AbstractMatrix a a
+        ^AbstractVector b b
+        result (new-dense-vector (.rowCount a))]
     (mp/add-inner-product! result a b 1.0)
     result))
 
