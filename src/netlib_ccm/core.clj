@@ -34,7 +34,7 @@
                (= 0 initial-column-count)))
      (throw (Exception. "Invalid strided view format a.")))
 
-   (when (< row-stride column-count)
+   (when (< ^long row-stride ^long column-count)
      (throw (Exception. "Row stride is less than column count")))
 
    (->StridedView data offset row-count column-count
@@ -196,7 +196,8 @@ and has no offset meaning it is accurately and completely represented by
                      (.data rhs) rhs-total-offset
                      op-amount)
                  (recur (+ rhs-row-offset op-amount))))))
-         (recur (inc rhs-row))))))
+         (recur (inc rhs-row)))))
+   lhs)
   ([^StridedView lhs op]
    (if (is-strided-view-dense? lhs)
      (let [op-len (get-strided-view-data-length lhs)]
@@ -208,7 +209,8 @@ and has no offset meaning it is accurately and completely represented by
              (let [data-offset (get-strided-view-data-offset-from-row lhs lhs-row)
                    lhs-total-offset (get-strided-view-total-offset lhs data-offset)]
                (op (.data lhs) lhs-total-offset row-len))))
-         (recur (inc lhs-row)))))))
+         (recur (inc lhs-row)))))
+   lhs))
 
 
 (defn strided-view-multiple-op!
@@ -258,8 +260,8 @@ of Rhs.length"
                             (java.util.Arrays/fill data offset (+ offset len) rhs-val))
             multiple-val-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
                               (.dcopy (BLAS/getInstance) (int op-len)
-                                      ^doubles rhs-data (int lhs-offset) 1
-                                      ^doubles lhs-data (int rhs-offset) 1))]
+                                      ^doubles rhs-data (int rhs-offset) 1
+                                      ^doubles lhs-data (int lhs-offset) 1))]
         (strided-view-multiple-op! lhs rhs multiple-val-op single-val-op)))))
 
 
@@ -308,7 +310,7 @@ of Rhs.length"
   (let [idx (atom 0)
         len (.length vec)]
     (reify java.util.Iterator
-      (hasNext [this] (< @idx len))
+      (hasNext [this] (< ^long @idx len))
       (next [this] (let [current @idx]
                      (swap! idx inc)
                      (.get vec current)))
@@ -319,7 +321,7 @@ of Rhs.length"
   (let [idx (atom 0)
         len (.rowCount mat)]
     (reify java.util.Iterator
-      (hasNext [this] (< @idx len))
+      (hasNext [this] (< ^long @idx len))
       (next [this] (let [current @idx]
                      (swap! idx inc)
                      (.getRow mat current)))
@@ -420,7 +422,7 @@ of Rhs.length"
 
 ;;A strided view of data where you can have N contiguous elements separated in rows of length Y.
 ;;Think of a small submatrix in a larger one
-(deftype StridedMatrix [^StridedView data row-count column-count]
+(deftype StridedMatrix [^StridedView data ^long row-count ^long column-count]
   netlib_ccm.core.NetlibItem
   netlib_ccm.core.AbstractView
   (^StridedView getStridedView [this] data)
@@ -524,7 +526,11 @@ with the same number of columns in each row"
     (when-not (and (= (.column-count view) (.initial-column-count view))
                    (= 0 (rem num-data-items (.columnCount m))))
       (throw (Exception. "Submatric views on offset matrixes are not supported")))
-    (let [data-start-offset (+ (* (.columnCount m) start-row) start-col)]
+    (let [^long start-row start-row
+          ^long start-col start-col
+          ^long num-rows num-rows
+          ^long num-cols num-cols
+          data-start-offset (+ (* (.columnCount m) start-row) start-col)]
         (when (or (> (+ start-row num-rows)
                      (.rowCount m))
                   (> (+ start-col num-cols)
@@ -608,9 +614,25 @@ with the same number of columns in each row"
 (defn do-new-matrix-nd
   [shape]
   (case (count shape)
+    0 (new-dense-vector 1)
     1 (new-dense-vector (first shape))
-    2 (->DenseMatrix (new-dense-vector (* (long (first shape)) (long (second shape)))
-                                      (first shape) (second shape)))))
+    2 (->DenseMatrix (new-dense-vector (* (long (first shape)) (long (second shape))))
+                     (first shape) (second shape))))
+
+(defprotocol ToNetlibType
+  (to-netlib [item]))
+
+(extend-protocol ToNetlibType
+  (Class/forName "[D")
+  (to-netlib [item] (->DenseVector item 0 (count item)))
+  clojure.lang.PersistentVector
+  (to-netlib [item] (do-construct-matrix item))
+  AbstractView
+  (to-netlib [item] item)
+  clojure.lang.ISeq
+  (to-netlib [item] (do-construct-matrix item))
+  Number
+  (to-netlib [item] (double item)))
 
 
 (extend-protocol mp/PImplementation
@@ -619,7 +641,7 @@ with the same number of columns in each row"
   (supports-dimensionality? [m dims] (in-range dims 0 3))
   (construct-matrix [m data] (do-construct-matrix data))
   (new-vector [m length] (new-dense-vector length))
-  (new-matrix [m rows columns] (->DenseMatrix (new-dense-vector (* rows columns)) rows columns))
+  (new-matrix [m ^long rows ^long columns] (->DenseMatrix (new-dense-vector (* rows columns)) rows columns))
   (new-matrix-nd [m shape] (do-new-matrix-nd shape)))
 
 
@@ -657,19 +679,26 @@ with the same number of columns in each row"
                           2 (mp/get-2d m (first indexes) (second indexes))
                           (throw (Exception. "Unsupported"))))))
 
+(defn set-zero-d
+  [^AbstractView view scalar]
+  (mp/assign! view scalar))
+
 (extend-protocol mp/PIndexedSettingMutable
   AbstractVector
   (set-1d! [m row v] (.set m row v))
   (set-2d! [m row column v] (throw (Exception. "Unsupported")))
-  (set-nd [m indexes v]
+  (set-nd! [m indexes v]
     (case (count indexes)
+      0 (set-zero-d m v)
       1 (mp/set-1d! m (first indexes) v)
       (throw (Exception. "Unsupported"))))
+
   AbstractMatrix
   (set-1d! [m row v] (.setRow m row v))
   (set-2d! [m row column v] (.set m row column v))
   (set-nd! [m indexes v]
     (case (count indexes)
+      0 (set-zero-d m v)
       1 (mp/set-1d! m (first indexes) v)
       2 (mp/set-2d! m (first indexes) (second indexes) v)
       (throw (Exception. "Unsupported")))))
@@ -865,13 +894,15 @@ with the same number of columns in each row"
       (assign-source-to-view! ddata m)
       m))
 
-  Double
+  Number
   (assign-source-to-view! [source m]
-    (let [^double source source
+    (let [source (double source)
           ^AbstractView m m]
-      (strided-op (.getStridedView m)
-                  (fn [^doubles data ^long offset ^long len]
-                    (java.util.Arrays/fill data offset (+ offset len) source)))
+      (if (= 0.0 source)
+        (mp/scale! m 0.0)
+        (strided-op (.getStridedView m)
+                    (fn [^doubles data ^long offset ^long len]
+                      (java.util.Arrays/fill data offset (+ offset len) source))))
       m)))
 
 
@@ -948,9 +979,9 @@ with the same number of columns in each row"
                             (recur (inc idx)))))
         multiple-val-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
                           (loop [idx 0]
-                            (when (< idx op-len)
-                              (let [lhs-offset (+ lhs-offset idx)
-                                    rhs-offset (+ rhs-offset idx)
+                            (when (< idx ^long op-len)
+                              (let [lhs-offset (+ ^long lhs-offset idx)
+                                    rhs-offset (+ ^long rhs-offset idx)
                                     lhs-val (aget ^doubles lhs-data lhs-offset)
                                     rhs-val (aget ^doubles rhs-data rhs-offset)]
                                 (aset ^doubles lhs-data lhs-offset (double (op lhs-val rhs-val))))
@@ -982,11 +1013,12 @@ with the same number of columns in each row"
   (source-view-op [source view op] (binary-immutable-op view source op))
   (source-view-op! [source view op] (binary-op! view source op))
 
-  Double
+  Number
   (source-view-op [source view op] (let [^AbstractView retval (clone-abstract-view view)]
-                                     (strided-op (.getStridedView retval) (partial op source))
+                                     (strided-op (.getStridedView retval) (partial op (double source)))
                                      retval))
-  (source-view-op! [source view op] (strided-op (.getStridedView ^AbstractView view) (partial op source))))
+  (source-view-op! [source view op] (strided-op (.getStridedView ^AbstractView view)
+                                                (partial op (double source)))))
 
 
 (extend-protocol mp/PFunctionalOperations
@@ -999,10 +1031,10 @@ with the same number of columns in each row"
 
   (element-map!
     ([m f] (do (unary-op! m f) m))
-    ([m f a] (do (source-view-op! a m f) m))
+    ([m f a] (do (source-view-op! (to-netlib a) m f) m))
     ([m f a more] (let [^StridedView view (.getStridedView ^AbstractView m)
                         num-items (get-strided-view-data-length view)
-                        rest-list (concat a more)]
+                        rest-list (mapv to-netlib (concat a more))]
                     (loop [idx 0]
                       (when (< idx num-items)
                         (let [m-offset (get-strided-view-total-offset view idx)
@@ -1077,6 +1109,7 @@ with the same number of columns in each row"
   AbstractView
   (add-scaled! [m a factor]
     (let [^StridedView m-view (.getStridedView ^AbstractView m)
+          a (to-netlib a)
           factor (double factor)]
       (if (instance? AbstractView a)
         (let [^StridedView a-view (.getStridedView ^AbstractView a)]
@@ -1092,8 +1125,8 @@ with the same number of columns in each row"
             (strided-op m-view a-view
                         (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
                           (.daxpy (BLAS/getInstance) op-len factor
-                                  ^doubles rhs-data rhs-offset
-                                  ^doubles lhs-data lhs-offset)))))
+                                  ^doubles rhs-data rhs-offset 1
+                                  ^doubles lhs-data lhs-offset 1)))))
         (ma/add! m (ma/mul a factor)))
       m)))
 
@@ -1250,7 +1283,7 @@ return true if they overlap"
   AbstractView
   (add-inner-product! [m a b] (mp/add-inner-product! m a b 1.0))
   (add-inner-product! [m a b factor]
-    (blas-gemm! factor a b 1.0 m)))
+    (blas-gemm! factor (to-netlib a) (to-netlib b) 1.0 m)))
 
 
 (defn get-arg-mat-type
@@ -1258,7 +1291,7 @@ return true if they overlap"
   (cond
     (instance? AbstractMatrix item) :matrix
     (instance? AbstractVector item) :vector
-    (instance? Double/TYPE item) :double
+    (instance? Number item) :double
     :else
     (throw (Exception. "Unsupported"))))
 
@@ -1309,7 +1342,7 @@ return true if they overlap"
   AbstractView
   ;;If these are both vectors, then this turns into dotproduct.
   (inner-product [a b]
-    (typed-inner-product a b))
+    (typed-inner-product a (to-netlib b)))
 
   (outer-product [m a]
     (if (mp/is-scalar? m)
@@ -1395,7 +1428,7 @@ return true if they overlap"
   (element-multiply! [m a]
     (if (ma/scalar? a)
       (ma/scale! m a)
-      (assign-source-to-view! (typed-element-multiply! m a (clone-abstract-view m)
+      (assign-source-to-view! (typed-element-multiply! m (to-netlib a) (clone-abstract-view m)
                                                        1.0 0.0)
                               m))))
 
@@ -1410,24 +1443,24 @@ return true if they overlap"
   (element-multiply [m a]
     (if (ma/scalar? a)
       (ma/scale! m a)
-      (typed-element-multiply! m a (clone-larger-view m a) 1.0 0.0))))
+      (typed-element-multiply! m (to-netlib a) (clone-larger-view m a) 1.0 0.0))))
 
 
 (extend-protocol mp/PAddScaledProductMutable
   AbstractView
-  (add-scaled-product! [m a b factor]
+  (add-scaled-product! [m a b ^double factor]
     (if (or (ma/scalar? a) (ma/scalar? b))
       (let [scalar-a? (ma/scalar? a)
             a (if scalar-a? b a)
             b (if scalar-a? a b)]
-        (mp/add-scaled! m a (* factor b)))
-      (typed-element-multiply! a b m factor 1.0))))
+        (mp/add-scaled! m a (* factor ^double b)))
+      (typed-element-multiply! (to-netlib a) (to-netlib b) m factor 1.0))))
 
 
 (extend-protocol mp/PAddScaledProduct
   AbstractView
   (add-scaled-product [m a b factor]
-    (mp/add-scaled-product! (clone-abstract-view m) a b factor)))
+    (mp/add-scaled-product! (clone-abstract-view m) (to-netlib a) (to-netlib b) factor)))
 
 
 (def empty-vec (new-dense-vector 0))
