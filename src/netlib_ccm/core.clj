@@ -1264,8 +1264,8 @@ return true if they overlap"
      (throw (Exception. "Unsupported")))
    (let [factor (double alpha)
          beta (double beta)
-         ^DenseMatrix a (make-dense-matrix a :row)
-         ^DenseMatrix b (make-dense-matrix b :column)
+         ^DenseMatrix a (make-dense-matrix (to-netlib a) :row)
+         ^DenseMatrix b (make-dense-matrix (to-netlib b) :column)
          ^AbstractView c c
          a-dims (if trans-a? [(.columnCount a) (.rowCount a)] [(.rowCount a) (.columnCount a)])
          b-dims (if trans-b? [(.columnCount b) (.rowCount b)] [(.rowCount b) (.columnCount b)])
@@ -1323,7 +1323,7 @@ return true if they overlap"
     (instance? AbstractVector item) :vector
     (instance? Number item) :double
     :else
-    (throw (Exception. "Unsupported"))))
+    (throw (Exception. (str "Unsupported type:" (type item))))))
 
 (defmulti typed-inner-product (fn [a b]
                                 [(get-arg-mat-type a)
@@ -1477,6 +1477,22 @@ return true if they overlap"
       (typed-element-multiply! m (to-netlib a) (clone-larger-view m a) 1.0 0.0))))
 
 
+(extend-protocol mp/PMatrixDivideMutable
+  AbstractView
+  (element-divide!
+    ([m] (mp/element-map! m /))
+    ([m a] (if (ma/scalar? a)
+             (ma/scale! m (/ 1.0 (double a)))
+             (binary-op! m a /)))))
+
+
+(extend-protocol mp/PMatrixDivide
+  AbstractView
+  (element-divide
+    ([m] (mp/element-divide! (clone-abstract-view m)))
+    ([m a] (mp/element-divide! (clone-abstract-view m) a))))
+
+
 (extend-protocol mp/PAddScaledProductMutable
   AbstractView
   (add-scaled-product! [m a b ^double factor]
@@ -1507,6 +1523,11 @@ return true if they overlap"
                     (ma/rows m)
                     (ma/columns retval)))
         retval))))
+
+
+(extend-protocol mp/PElementCount
+  AbstractView
+  (element-count [m] (get-strided-view-data-length (.getStridedView ^AbstractView m))))
 
 
 (def empty-vec (new-dense-vector 0))
