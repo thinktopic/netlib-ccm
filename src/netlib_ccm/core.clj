@@ -628,6 +628,23 @@ with the same number of columns in each row"
     2 (->DenseMatrix (new-dense-vector (* (long (first shape)) (long (second shape))))
                      (first shape) (second shape))))
 
+(defn new-dense-matrix
+  [row-count column-count]
+  (do-new-matrix-nd [row-count column-count]))
+
+
+(defn view-as-dense-matrix
+  ^DenseMatrix [^AbstractView v ^long num-rows ^long num-columns]
+  (let [^StridedView view (.getStridedView v)]
+    (when-not (is-strided-view-dense? view)
+      (throw (Exception. "Unsupported")))
+    (let [item-count (* num-rows num-columns)
+          data-len (get-strided-view-data-length view)]
+      (when-not (= item-count data-len)
+        (throw (Exception. "Unsupported")))
+      (->DenseMatrix (strided-view-to-vector view) num-rows num-columns))))
+
+
 (defprotocol ToNetlibType
   (to-netlib [item]))
 
@@ -1241,46 +1258,51 @@ return true if they overlap"
 
 (defn blas-gemm!
   "Defaults to a being a row-matrix if a vector and b being a column-matrix if a vector"
-  [alpha a b beta c]
-  (when-not (and (matrix-or-vector? a)
-                 (matrix-or-vector? b))
-    (throw (Exception. "Unsupported")))
-  (let [factor (double alpha)
-        beta (double beta)
-        ^DenseMatrix a (make-dense-matrix a :row)
-        ^DenseMatrix b (make-dense-matrix b :column)
-        ^AbstractView c c
-        M (.rowCount a)
-        N (.columnCount b)
-        K (.rowCount b)
-        overlapping? (or (are-abstract-views-overlapping? a c)
-                         (are-abstract-views-overlapping? b c))
-        dest (if overlapping?
-               (clone-abstract-view c)
-               c)
-        ;;C is a MxN matrix.
-        ^DenseMatrix m (cond
-                         (= 1 M) (make-dense-matrix dest :row)
-                         (= 1 N) (make-dense-matrix dest :column)
-                         :else
-                         (make-dense-matrix dest))
-        ^DenseVector a-data (.data a)
-        ^DenseVector b-data (.data b)
-        ^DenseVector m-data (.data m)]
-    (when-not (and (= K (.columnCount a))
-                   (= M (.rowCount m))
-                   (= N (.columnCount m)))
-      (throw (Exception. (format "Incompatible matrix sizes: a %s b %s m %s"
-                                 (str (ma/shape a))
-                                 (str (ma/shape b))
-                                 (str (ma/shape m))))))
-    (.dgemm (BLAS/getInstance) "n" "n" N M K alpha
-            (.data b-data) (.offset b-data) (.columnCount b)
-            (.data a-data) (.offset a-data) (.columnCount a)
-            beta
-            (.data m-data) (.offset m-data) (.columnCount m))
-    (assign-source-to-view! m c))
-  )
+  ([trans-a? trans-b? alpha a b beta c]
+   (when-not (and (matrix-or-vector? a)
+                  (matrix-or-vector? b))
+     (throw (Exception. "Unsupported")))
+   (let [factor (double alpha)
+         beta (double beta)
+         ^DenseMatrix a (make-dense-matrix a :row)
+         ^DenseMatrix b (make-dense-matrix b :column)
+         ^AbstractView c c
+         a-dims (if trans-a? [(.columnCount a) (.rowCount a)] [(.rowCount a) (.columnCount a)])
+         b-dims (if trans-b? [(.columnCount b) (.rowCount b)] [(.rowCount b) (.columnCount b)])
+         M (first a-dims)
+         N (second b-dims)
+         K (first b-dims)
+         overlapping? (or (are-abstract-views-overlapping? a c)
+                          (are-abstract-views-overlapping? b c))
+         dest (if overlapping?
+                (clone-abstract-view c)
+                c)
+         ;;C is a MxN matrix.
+         ^DenseMatrix m (cond
+                          (= 1 M) (make-dense-matrix dest :row)
+                          (= 1 N) (make-dense-matrix dest :column)
+                          :else
+                          (make-dense-matrix dest))
+         ^DenseVector a-data (.data a)
+         ^DenseVector b-data (.data b)
+         ^DenseVector m-data (.data m)
+         trans-command-a (if trans-a? "t" "n")
+         trans-command-b (if trans-b? "t" "n")]
+     (when-not (and (= K (second a-dims))
+                    (= M (.rowCount m))
+                    (= N (.columnCount m)))
+       (throw (Exception. (format "Incompatible matrix sizes: a %s b %s m %s"
+                                  (str a-dims)
+                                  (str b-dims)
+                                  (str (ma/shape m))))))
+     (.dgemm (BLAS/getInstance) trans-command-b trans-command-a N M K alpha
+             (.data b-data) (.offset b-data) (.columnCount b)
+             (.data a-data) (.offset a-data) (.columnCount a)
+             beta
+             (.data m-data) (.offset m-data) (.columnCount m))
+     (assign-source-to-view! m c)))
+  ([alpha a b beta c]
+   (blas-gemm! false false alpha a b beta c)))
 
 ;;General protocol for things of the shape:
 ;;c = alpha*A*b + beta*c
@@ -1368,7 +1390,7 @@ return true if they overlap"
         ^DenseVector x (make-dense-vector x)
         ^AbstractView y y
         overlapping? (or (are-strided-views-overlapping? (.getStridedView a)
-                                                          (.getStridedView y))
+                                                         (.getStridedView y))
                          (are-strided-views-overlapping? (.getStridedView x)
                                                          (.getStridedView y)))
         dest (if overlapping?
@@ -1470,6 +1492,21 @@ return true if they overlap"
   AbstractView
   (add-scaled-product [m a b factor]
     (mp/add-scaled-product! (clone-abstract-view m) (to-netlib a) (to-netlib b) factor)))
+
+
+;;Turns out this is a common operation...
+(extend-protocol mp/PTranspose
+  AbstractView
+  (transpose [m]
+    (if (instance? AbstractVector m)
+      m
+      (let [^AbstractMatrix m m
+            ^DenseMatrix retval (new-dense-matrix (.columnCount m) (.rowCount m))]
+        (doall (map (fn [source-row dest-column]
+                      (assign-source-to-view! source-row dest-column))
+                    (ma/rows m)
+                    (ma/columns retval)))
+        retval))))
 
 
 (def empty-vec (new-dense-vector 0))

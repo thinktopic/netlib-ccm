@@ -58,6 +58,15 @@
                 (m/inner-product a b)))))))
 
 
+(defn transpose-perftest
+  []
+  (let [iterations 10]
+    (doseq [size [10 100 500]
+            impl [:vectorz :netlib]]
+      (println "size" size "impl" impl)
+      (let [a (m/array impl (repeat size  (range 1 (+ size 1))))]
+        (time (dotimes [iter iterations]
+                (m/transpose a)))))))
 
 
 (defn inner-product
