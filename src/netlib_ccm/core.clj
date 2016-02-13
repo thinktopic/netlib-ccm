@@ -609,6 +609,12 @@ with the same number of columns in each row"
   ^DenseVector [data]
   (new-dense-vector-from-array (double-array-from-data data)))
 
+
+(defn new-dense-matrix
+  ^DenseMatrix [^long row-count ^long column-count]
+  (->DenseMatrix (new-dense-vector (* row-count column-count))
+                 row-count column-count))
+
 (defn do-construct-matrix
   [data]
   (let [shape (ma/shape data)
@@ -625,13 +631,7 @@ with the same number of columns in each row"
   (case (count shape)
     0 (new-dense-vector 1)
     1 (new-dense-vector (first shape))
-    2 (->DenseMatrix (new-dense-vector (* (long (first shape)) (long (second shape))))
-                     (first shape) (second shape))))
-
-(defn new-dense-matrix
-  [row-count column-count]
-  (do-new-matrix-nd [row-count column-count]))
-
+    2 (new-dense-matrix (first shape) (second shape))))
 
 (defn view-as-dense-matrix
   ^DenseMatrix [^AbstractView v ^long num-rows ^long num-columns]
@@ -975,6 +975,14 @@ with the same number of columns in each row"
     (.clone ^AbstractVector view)))
 
 
+(defn new-abstract-view
+  [^AbstractView view]
+  (if (instance? AbstractMatrix view)
+    (let [^AbstractMatrix view view]
+      (new-dense-matrix (.rowCount view) (.columnCount view)))
+    (new-dense-vector (.length ^AbstractVector view))))
+
+
 (defn unary-op!
   [^AbstractView view op]
   (let [^StridedView view (.getStridedView view)]
@@ -1129,36 +1137,101 @@ with the same number of columns in each row"
   (length-squared [a] (abstract-view-dot a a))
   (normalize [a] (ma/div a (Math/sqrt (abstract-view-dot a a)))))
 
+(defn get-arg-mat-type
+  [item]
+  (cond
+    (instance? AbstractMatrix item) :matrix
+    (instance? AbstractVector item) :vector
+    (instance? Number item) :double
+    :else
+    (throw (Exception. (str "Unsupported type:" (type item))))))
+
+
+
+(defn blas-axpy
+  "y gets ax + y.  x, y are abstract views and alpha is a double"
+  [^double alpha x ^AbstractView y]
+  (let [^AbstractView x (to-netlib x)
+        alpha (double alpha)
+        ^AbstractView y y
+        ^StridedView x-view (.getStridedView x)
+        ^StridedView y-view (.getStridedView y)
+        x-len (get-strided-view-data-length x-view)
+        y-len (get-strided-view-data-length y-view)]
+    (when-not (= 0 (rem y-len x-len))
+      (throw (Exception. "y-len must be even multiple of x-len")))
+    (if (= 1 x-len)
+      (let [x-val (aget ^doubles (.data x-view)
+                        (get-strided-view-total-offset x-view 0))]
+        (mp/matrix-add! y (* alpha x-val)))
+      (let [num-ops (quot y-len x-len)
+            op-len x-len]
+        (loop [op-idx 0]
+          (when (< op-idx num-ops)
+            (let [new-y-view (create-sub-strided-view y-view (* op-idx op-len) op-len)]
+              (strided-op (create-sub-strided-view y) x
+                          (fn [y-data y-offset x-data x-offset op-len]
+                            (.daxpy (BLAS/getInstance) op-len alpha
+                                    ^doubles y-data ^long y-offset 1
+                                    ^doubles x-data ^long x-offset 1))))
+            (recur (inc op-idx)))))))
+  y)
+
+
 
 (extend-protocol mp/PAddScaledMutable
   AbstractView
   (add-scaled! [m a factor]
-    (let [^StridedView m-view (.getStridedView ^AbstractView m)
-          a (to-netlib a)
-          factor (double factor)]
-      (if (instance? AbstractView a)
-        (let [^StridedView a-view (.getStridedView ^AbstractView a)]
-          (if (and (is-strided-view-dense? m-view)
-                   (is-strided-view-dense? a-view))
-            (let [copy-len (min (get-strided-view-data-length m-view)
-                                (get-strided-view-data-length a-view))]
-              (when (> copy-len 0)
-                (.daxpy (BLAS/getInstance) copy-len factor
-                        (.data a-view) (get-strided-view-total-offset a-view 0) 1
-                        (.data m-view) (get-strided-view-total-offset m-view 0) 1)))
-            ;;slow(er) fallback
-            (strided-op m-view a-view
-                        (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
-                          (.daxpy (BLAS/getInstance) op-len factor
-                                  ^doubles rhs-data rhs-offset 1
-                                  ^doubles lhs-data lhs-offset 1)))))
-        (ma/add! m (ma/mul a factor)))
-      m)))
+    (if (ma/scalar? a)
+      (mp/matrix-add! m (* ^double a ^double factor))
+      (blas-axpy factor a m))))
+
 
 (extend-protocol mp/PAddScaled
   AbstractView
   (add-scaled [m a factor]
     (mp/add-scaled! (clone-abstract-view m) a factor)))
+
+(defonce ones-data (atom (new-dense-vector 1000)))
+
+(defn ones
+  "Array of ones of length m.  Don't assign to this or you get what you get."
+  [m]
+  (let [ones-len (if (ma/scalar? m)
+                   (long m)
+                   (get-strided-view-data-length (.getStridedView ^AbstractView m)))]
+    (loop [^DenseVector current-ones @ones-data]
+      (let [current-len (.length current-ones)]
+        (if (< ones-len current-len)
+          (let [new-len (* 2 ones-len)
+                ^DenseVector new-data (new-dense-vector new-len)]
+            (java.util.Arrays/fill ^doubles (.data new-data) 0 new-len 1.0)
+            (compare-and-set! ones-data current-ones new-data)
+            (recur @ones-data))
+          (ma/subvector current-ones 0 ones-len))))))
+
+
+(extend-protocol mp/PMatrixAddMutable
+  AbstractView
+  (matrix-add! [m a]
+    (if (ma/scalar? a)
+      (let [^AbstractView m m
+            ^double a a]
+        (blas-axpy a (ones m) m))
+      (blas-axpy 1.0 a m)))
+  (matrix-sub! [m a]
+    (if (ma/scalar? a)
+      (let [^AbstractView m m
+            a (* -1.0 ^double a)]
+        (blas-axpy a (ones m) m))
+      (blas-axpy -1.0 a m))))
+
+(extend-protocol mp/PMatrixAdd
+  AbstractView
+  (matrix-add [m a]
+    (mp/matrix-add! (clone-abstract-view m) a))
+  (matrix-sub [m a]
+    (mp/matrix-sub! (clone-abstract-view m) a)))
 
 
 (extend-protocol mp/PMatrixMutableScaling
@@ -1212,15 +1285,15 @@ with the same number of columns in each row"
   (^DenseMatrix [m vector-to-matrix-conversion]
    (if (instance? AbstractMatrix m)
      (make-dense-matrix m)
-     (let [^DenseVector vec (make-dense-vector m)
-           vec-len (.length vec)
+     (let [^DenseVector dense-vec (make-dense-vector m)
+           vec-len (.length dense-vec)
            column-count (if (= :row vector-to-matrix-conversion)
                           vec-len
                           1)
            row-count (if (= :row vector-to-matrix-conversion)
                        1
                        vec-len)]
-       (->DenseMatrix vec row-count column-count)))))
+       (->DenseMatrix dense-vec row-count column-count)))))
 
 
 (defn matrix-or-vector?
@@ -1304,6 +1377,57 @@ return true if they overlap"
   ([alpha a b beta c]
    (blas-gemm! false false alpha a b beta c)))
 
+
+(defmulti typed-blas-gemm! (fn [trans-a? trans-b? alpha a b beta c]
+                             [(get-arg-mat-type a)
+                              (get-arg-mat-type b)]))
+
+(defmethod typed-blas-gemm! [:matrix :matrix]
+  [trans-a? trans-b? alpha a b beta c]
+  (blas-gemm! trans-a? trans-b? alpha a b beta c))
+
+(defmethod typed-blas-gemm! [:matrix :vector]
+  [trans-a? trans-b? alpha a b beta c]
+  (blas-gemm! trans-a? trans-b? alpha a b beta c))
+
+(defmethod typed-blas-gemm! [:vector :matrix]
+  [trans-a? trans-b? alpha a b beta c]
+  (blas-gemm! trans-a? trans-b? alpha a b beta c))
+
+
+(defmethod typed-blas-gemm! [:vector :vector]
+  [trans-a? trans-b? alpha a b beta c]
+  (let [outer-product? (or trans-a? trans-b?)]
+    (if (outer-product?)
+      (blas-gemm! trans-a? trans-b? alpha a b beta c)
+      (+ (* ^double alpha ^double (dot-abstract-views a b))
+         (* ^double beta ^double c)))))
+
+
+(defn typed-blas-gemm-view-scalar!
+  "A is a view, alpha b beta are scalars.  C is a view"
+  [alpha a b beta c]
+  (let [^double beta beta]
+    (if (= 0.0 beta)
+      (do
+        (mp/assign! c a)
+        (mp/scale! c b))
+      (do
+        (mp/scale! c beta)
+        (blas-axpy b a c)))
+    c))
+
+
+(defmethod typed-blas-gemm! [:vector :scalar]
+  [trans-a? trans-b? alpha a b beta c]
+  (typed-blas-gemm-view-scalar! alpha a b beta c))
+
+
+(defmethod typed-blas-gemm! [:matrix :scalar]
+  [trans-a? trans-b? alpha a b beta c]
+  (typed-blas-gemm-view-scalar! alpha a b beta c))
+
+
 ;;General protocol for things of the shape:
 ;;c = alpha*A*b + beta*c
 ;;if c is a vector then we know that b is a vector
@@ -1313,67 +1437,81 @@ return true if they overlap"
   AbstractView
   (add-inner-product! [m a b] (mp/add-inner-product! m a b 1.0))
   (add-inner-product! [m a b factor]
-    (blas-gemm! factor (to-netlib a) (to-netlib b) 1.0 m)))
+    (typed-blas-gemm! false false factor (to-netlib a) (to-netlib b) 1.0 m)))
 
 
-(defn get-arg-mat-type
-  [item]
-  (cond
-    (instance? AbstractMatrix item) :matrix
-    (instance? AbstractVector item) :vector
-    (instance? Number item) :double
-    :else
-    (throw (Exception. (str "Unsupported type:" (type item))))))
+(defmulti create-result-for-inner-product (fn [trans-a? trans-b? a b]
+                                            [(get-arg-mat-type a)
+                                             (get-arg-mat-type b)]))
 
-(defmulti typed-inner-product (fn [a b]
-                                [(get-arg-mat-type a)
-                                 (get-arg-mat-type b)]))
-
-(defmethod typed-inner-product [:matrix :vector]
-  [a b]
-  (let [^AbstractMatrix a a
-        ^AbstractVector b b
-        result (new-dense-vector (.rowCount a))]
-    (mp/add-inner-product! result a b 1.0)
-    result))
-
-(defmethod typed-inner-product [:matrix :scalar]
-  [a b]
-  (ma/scale a b))
+(defn get-item-shape-result
+  (^long [trans? ^long row-count ^long column-count rows-or-columns]
+   (if trans?
+     (if (= :row-count rows-or-columns)
+       column-count
+       row-count)
+     (if (= :row-count rows-or-columns)
+       row-count
+       column-count)))
+  (^long [trans? shape ^long rows-or-columns]
+   (get-item-shape-result trans? (shape 0) (shape 1) rows-or-columns)))
 
 
-(defmethod typed-inner-product [:matrix :matrix]
-  [a b]
-  (let [^AbstractMatrix a a
-        ^AbstractMatrix b b
-        result-rows (.rowCount a)
-        result-cols (.columnCount b)
-        result  (->DenseMatrix (new-dense-vector (* result-rows result-cols))
-                               result-rows result-cols)]
-    (mp/add-inner-product! result a b 1.0)
-    result))
+(defn get-item-shape
+  "Defaults to row vectors"
+  ^long [trans? item rows-or-columns]
+  (let [mat-type (get-arg-mat-type item)]
+    (cond
+      (= mat-type :matrix) (get-item-shape-result trans? (ma/shape item)
+                                                  rows-or-columns)
+      (= mat-type :vector) (get-item-shape-result trans? (.length ^AbstractVector item) 1
+                                                  rows-or-columns)
+      :else 1)))
 
-(defmethod typed-inner-product [:vector :vector]
-  [a b]
-  (ma/dot a b))
 
-(defmethod typed-inner-product [:vector :matrix]
-  [a b]
-  (let [^AbstractVector a a
-        result (new-dense-vector (.length a))]
-    (mp/add-inner-product! result a b 1.0)
-    result))
+(defn shape-to-inner-product-result
+  [^long row-count ^long column-count]
+  (if (and (= 1 row-count)
+           (= 1 column-count))
+    0.0
+    (let [^DenseVector backing (new-dense-vector (* row-count column-count))]
+      (if (or (= 1 row-count)
+              (= 1 column-count))
+        backing
+        (->DenseMatrix backing row-count column-count)))))
 
-(defmethod typed-inner-product [:vector :scalar]
-  [a b]
-  (ma/scale a b))
+
+(defn create-result-for-gemm
+  [trans-a? trans-b? a b]
+  (let [scalar-a? (ma/scalar? a)
+        scalar-b? (ma/scalar? b)]
+    (if (or scalar-a?
+            scalar-b?)
+      (if (and scalar-a?
+               scalar-b?)
+        0.0
+        (if scalar-a?
+          (new-abstract-view b)
+          (new-abstract-view a)))
+      ;;Else neither are scalars and off we go...
+      (let [row-count (get-item-shape trans-a? a :row)
+            column-count (get-item-shape trans-b? b :column)]
+        (shape-to-inner-product-result row-count column-count)))))
+
+
+(defn blas-gemm
+  [trans-a? trans-b? alpha a b]
+  (let [a (to-netlib a)
+        b (to-netlib b)]
+    (typed-blas-gemm! trans-a? trans-b? alpha a b 0.0
+                      (create-result-for-gemm trans-a? trans-b? a b))))
 
 
 (extend-protocol mp/PMatrixProducts
   AbstractView
   ;;If these are both vectors, then this turns into dotproduct.
   (inner-product [a b]
-    (typed-inner-product a (to-netlib b)))
+    (blas-gemm false false 1.0 a b))
 
   (outer-product [m a]
     (if (mp/is-scalar? m)
@@ -1462,7 +1600,6 @@ return true if they overlap"
       (assign-source-to-view! (typed-element-multiply! m (to-netlib a) (clone-abstract-view m)
                                                        1.0 0.0)
                               m))))
-
 
 (extend-protocol mp/PMatrixMultiply
   AbstractView
