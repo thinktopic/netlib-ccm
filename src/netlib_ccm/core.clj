@@ -628,10 +628,12 @@ with the same number of columns in each row"
 
 (defn do-new-matrix-nd
   [shape]
-  (case (count shape)
-    0 (new-dense-vector 1)
-    1 (new-dense-vector (first shape))
-    2 (new-dense-matrix (first shape) (second shape))))
+  (if (ma/scalar? shape)
+    (new-dense-vector shape)
+    (case (count shape)
+      0 (new-dense-vector 1)
+      1 (new-dense-vector (first shape))
+      2 (new-dense-matrix (first shape) (second shape)))))
 
 (defn view-as-dense-matrix
   ^DenseMatrix [^AbstractView v ^long num-rows ^long num-columns]
@@ -667,7 +669,8 @@ with the same number of columns in each row"
   (supports-dimensionality? [m dims] (in-range dims 0 3))
   (construct-matrix [m data] (do-construct-matrix data))
   (new-vector [m length] (new-dense-vector length))
-  (new-matrix [m ^long rows ^long columns] (->DenseMatrix (new-dense-vector (* rows columns)) rows columns))
+  (new-matrix [m ^long rows ^long columns]
+    (->DenseMatrix (new-dense-vector (* rows columns)) rows columns))
   (new-matrix-nd [m shape] (do-new-matrix-nd shape)))
 
 
@@ -800,15 +803,16 @@ with the same number of columns in each row"
 
 
 (extend-protocol mp/PDense
-  NetlibItem
-  (dense-coerce [m data] (new-dense-vector-from-data data))
-
-  DenseVector
-  (dense [m] m)
-  DenseMatrix
-  (dense [m] m)
   AbstractView
-  (dense [m] (new-dense-vector-from-strided-view (.getStridedView ^AbstractView m))))
+  (dense [m]
+    (let [^StridedView new-data (clone-strided-view (.getStridedView ^AbstractView m))
+          dense-vec (->DenseVector (.data new-data) 0 (get-strided-view-data-length new-data))]
+      (if (instance? AbstractVector m)
+        dense-vec
+        (let [^AbstractMatrix m m]
+          (->DenseMatrix dense-vec (.rowCount m) (.columnCount m))))))
+
+  (dense-coerce [m data] (new-dense-vector-from-data data)))
 
 
 (extend-protocol mp/PConversion
