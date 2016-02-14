@@ -131,31 +131,33 @@
   ;;special case for (= 0 length)
   (if (= 0 length)
     (new-strided-view (.data view) (get-strided-view-total-offset view 0) 0)
-    (do
-      (check-strided-view-data-offset view offset)
-      (check-strided-view-data-offset view (+ offset (max 0 (- length 1))))
-      (let [data-len (get-strided-view-data-length view)]
-        (let [first-row-len (if (< offset (.initial-column-count view))
-                              (- (.initial-column-count view) offset)
-                              (- (.column-count view)
-                                 (rem (- offset (.initial-column-count view))
-                                      (.column-count view))))
-              first-row-offset (- (.column-count view) first-row-len)]
-          (if (<= length first-row-len)
-            (new-strided-view (.data view) (get-strided-view-total-offset view offset) length)
-            (let [row-idx (get-strided-view-row-from-data-offset view offset)
-                  last-row-len (rem (+ first-row-offset length) (.column-count view))
-                  ary-offset (+ (.offset view) (* (.row-stride view) row-idx))
-                  body-num-rows (quot (- length (+ first-row-len last-row-len))
-                                      (.column-count view))
-                  ini-row (long (if-not (= 0 first-row-len) 1 0))
-                  end-row 1]
-              (new-strided-view (.data view) ary-offset
-                                (+ body-num-rows ini-row end-row)
-                                (.column-count view)
-                                (.row-stride view)
-                                first-row-len
-                                last-row-len))))))))
+    (if (= length (get-strided-view-data-length view))
+      view
+      (do
+        (check-strided-view-data-offset view offset)
+        (check-strided-view-data-offset view (+ offset (max 0 (- length 1))))
+        (let [data-len (get-strided-view-data-length view)]
+          (let [first-row-len (if (< offset (.initial-column-count view))
+                                (- (.initial-column-count view) offset)
+                                (- (.column-count view)
+                                   (rem (- offset (.initial-column-count view))
+                                        (.column-count view))))
+                first-row-offset (- (.column-count view) first-row-len)]
+            (if (<= length first-row-len)
+              (new-strided-view (.data view) (get-strided-view-total-offset view offset) length)
+              (let [row-idx (get-strided-view-row-from-data-offset view offset)
+                    last-row-len (rem (+ first-row-offset length) (.column-count view))
+                    ary-offset (+ (.offset view) (* (.row-stride view) row-idx))
+                    body-num-rows (quot (- length (+ first-row-len last-row-len))
+                                        (.column-count view))
+                    ini-row (long (if-not (= 0 first-row-len) 1 0))
+                    end-row 1]
+                (new-strided-view (.data view) ary-offset
+                                  (+ body-num-rows ini-row end-row)
+                                  (.column-count view)
+                                  (.row-stride view)
+                                  first-row-len
+                                  last-row-len)))))))))
 
 (defn is-strided-view-dense?
   "A dense strided view is one has no gaps in its data"
@@ -1173,11 +1175,11 @@ with the same number of columns in each row"
         (loop [op-idx 0]
           (when (< op-idx num-ops)
             (let [new-y-view (create-sub-strided-view y-view (* op-idx op-len) op-len)]
-              (strided-op (create-sub-strided-view y) x
+              (strided-op new-y-view x-view
                           (fn [y-data y-offset x-data x-offset op-len]
                             (.daxpy (BLAS/getInstance) op-len alpha
-                                    ^doubles y-data ^long y-offset 1
-                                    ^doubles x-data ^long x-offset 1))))
+                                    ^doubles x-data ^long x-offset 1
+                                    ^doubles y-data ^long y-offset 1))))
             (recur (inc op-idx)))))))
   y)
 
