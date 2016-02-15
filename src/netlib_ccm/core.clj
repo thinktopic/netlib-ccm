@@ -2,7 +2,6 @@
   (:require [clojure.core.matrix :as ma]
             [clojure.core.matrix.protocols :as mp]
             [clojure.core.matrix.implementations :as mi]
-            [clojure.core.matrix.impl.mathsops :as mops]
             [clojure.pprint])
   (:import [com.github.fommil.netlib BLAS]))
 
@@ -1160,28 +1159,6 @@ with the same number of columns in each row"
     (throw (Exception. (str "Unsupported type:" (type item))))))
 
 
-(defn hybrid-blas-axpy
-  [alpha y-data y-offset x-data x-offset op-len]
-  (let [^doubles y-data y-data
-        ^long y-offset y-offset
-        ^doubles x-data x-data
-        ^long x-offset x-offset
-        ^long op-len op-len
-        ^double alpha alpha]
-    ;;Found through some perf testing.  Probably different ratios
-    ;;on other architectures.
-    (if (< op-len 100)
-      (loop [idx 0]
-        (when (< idx op-len)
-          (aset y-data (+ y-offset idx)
-                (+ (* alpha (aget x-data (+ x-offset idx)))
-                   (aget y-data (+ y-offset idx))))
-          (recur (inc idx))))
-      (.daxpy (BLAS/getInstance) op-len alpha
-              ^doubles x-data ^long x-offset 1
-              ^doubles y-data ^long y-offset 1))))
-
-
 (defn blas-axpy
   "y gets ax + y.  x, y are abstract views and alpha is a double"
   [^double alpha x ^AbstractView y]
@@ -1199,12 +1176,32 @@ with the same number of columns in each row"
                         (get-strided-view-total-offset x-view 0))]
         (mp/matrix-add! y (* alpha x-val)))
       (let [num-ops (quot y-len x-len)
-            op-len x-len]
-        (loop [op-idx 0]
-          (when (< op-idx num-ops)
-            (let [new-y-view (create-sub-strided-view y-view (* op-idx op-len) op-len)]
-              (strided-op new-y-view x-view (partial hybrid-blas-axpy alpha)))
-            (recur (inc op-idx)))))))
+            op-len x-len
+            axpy-op (fn [y-data y-offset x-data x-offset op-len]
+                      (let [^doubles y-data y-data
+                            ^long y-offset y-offset
+                            ^doubles x-data x-data
+                            ^long x-offset x-offset
+                            ^long op-len op-len]
+                        ;;Found through some perf testing.  Probably different ratios
+                        ;;on other architectures.
+                        (if (< op-len 40)
+                          (loop [idx 0]
+                            (when (< idx op-len)
+                              (aset y-data (+ y-offset idx)
+                                    (+ (* alpha (aget x-data (+ x-offset idx)))
+                                       (aget y-data (+ y-offset idx))))
+                              (recur (inc idx))))
+                          (.daxpy (BLAS/getInstance) op-len alpha
+                                  ^doubles x-data ^long x-offset 1
+                                  ^doubles y-data ^long y-offset 1))))]
+        (if (= 1 num-ops)
+          (strided-op y-view x-view axpy-op)
+          (loop [op-idx 0]
+           (when (< op-idx num-ops)
+             (let [new-y-view (create-sub-strided-view y-view (* op-idx op-len) op-len)]
+               (strided-op new-y-view x-view axpy-op))
+             (recur (inc op-idx))))))))
   y)
 
 
@@ -1232,9 +1229,10 @@ with the same number of columns in each row"
                    (get-strided-view-data-length (.getStridedView ^AbstractView m)))]
     (loop [^DenseVector current-ones @ones-data]
       (let [current-len (.length current-ones)]
-        (if (< ones-len current-len)
+        (if (> ones-len current-len)
           (let [new-len (* 2 ones-len)
                 ^DenseVector new-data (new-dense-vector new-len)]
+            (println "creating new ones!")
             (java.util.Arrays/fill ^doubles (.data new-data) 0 new-len 1.0)
             (compare-and-set! ones-data current-ones new-data)
             (recur @ones-data))
