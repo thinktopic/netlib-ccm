@@ -270,9 +270,15 @@ of Rhs.length"
       (let [single-val-op (fn [^doubles data ^long offset ^long len ^double rhs-val]
                             (java.util.Arrays/fill data offset (+ offset len) rhs-val))
             multiple-val-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
-                              (.dcopy (BLAS/getInstance) (int op-len)
-                                      ^doubles rhs-data (int rhs-offset) 1
-                                      ^doubles lhs-data (int lhs-offset) 1))]
+                              (System/arraycopy ^doubles rhs-data ^long rhs-offset
+                                                ^doubles lhs-data ^long lhs-offset
+                                                op-len)
+                              ;; Testing shows arraycopy to be faster than .dcopy in every
+                              ;; case
+                              ;; (.dcopy (BLAS/getInstance) (int op-len)
+                              ;;         ^doubles rhs-data (int rhs-offset) 1
+                              ;;         ^doubles lhs-data (int lhs-offset) 1)
+                              )]
         (strided-view-multiple-op! lhs rhs multiple-val-op single-val-op)))))
 
 
@@ -641,11 +647,12 @@ with the same number of columns in each row"
   ^DenseMatrix [^AbstractView v ^long num-rows ^long num-columns]
   (let [^StridedView view (.getStridedView v)]
     (when-not (is-strided-view-dense? view)
-      (throw (Exception. "Unsupported")))
+      (throw (Exception. "Unsupported for non dense views")))
     (let [item-count (* num-rows num-columns)
           data-len (get-strided-view-data-length view)]
       (when-not (= item-count data-len)
-        (throw (Exception. "Unsupported")))
+        (throw (Exception. (format "Unsupported as item-count data-len mismatch %d vs %d"
+                                   item-count data-len))))
       (->DenseMatrix (strided-view-to-vector view) num-rows num-columns))))
 
 
@@ -1153,6 +1160,27 @@ with the same number of columns in each row"
     (throw (Exception. (str "Unsupported type:" (type item))))))
 
 
+(defn hybrid-blas-axpy
+  [alpha y-data y-offset x-data x-offset op-len]
+  (let [^doubles y-data y-data
+        ^long y-offset y-offset
+        ^doubles x-data x-data
+        ^long x-offset x-offset
+        ^long op-len op-len
+        ^double alpha alpha]
+    ;;Found through some perf testing.  Probably different ratios
+    ;;on other architectures.
+    (if (< op-len 100)
+      (loop [idx 0]
+        (when (< idx op-len)
+          (aset y-data (+ y-offset idx)
+                (+ (* alpha (aget x-data (+ x-offset idx)))
+                   (aget y-data (+ y-offset idx))))
+          (recur (inc idx))))
+      (.daxpy (BLAS/getInstance) op-len alpha
+              ^doubles x-data ^long x-offset 1
+              ^doubles y-data ^long y-offset 1))))
+
 
 (defn blas-axpy
   "y gets ax + y.  x, y are abstract views and alpha is a double"
@@ -1175,11 +1203,7 @@ with the same number of columns in each row"
         (loop [op-idx 0]
           (when (< op-idx num-ops)
             (let [new-y-view (create-sub-strided-view y-view (* op-idx op-len) op-len)]
-              (strided-op new-y-view x-view
-                          (fn [y-data y-offset x-data x-offset op-len]
-                            (.daxpy (BLAS/getInstance) op-len alpha
-                                    ^doubles x-data ^long x-offset 1
-                                    ^doubles y-data ^long y-offset 1))))
+              (strided-op new-y-view x-view (partial hybrid-blas-axpy alpha)))
             (recur (inc op-idx)))))))
   y)
 
@@ -1459,7 +1483,7 @@ return true if they overlap"
      (if (= :row-count rows-or-columns)
        row-count
        column-count)))
-  (^long [trans? shape ^long rows-or-columns]
+  (^long [trans? shape rows-or-columns]
    (get-item-shape-result trans? (shape 0) (shape 1) rows-or-columns)))
 
 
@@ -1500,8 +1524,8 @@ return true if they overlap"
           (new-abstract-view b)
           (new-abstract-view a)))
       ;;Else neither are scalars and off we go...
-      (let [row-count (get-item-shape trans-a? a :row)
-            column-count (get-item-shape trans-b? b :column)]
+      (let [row-count (get-item-shape trans-a? a :row-count)
+            column-count (get-item-shape trans-b? b :column-count)]
         (shape-to-inner-product-result row-count column-count)))))
 
 
