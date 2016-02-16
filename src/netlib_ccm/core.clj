@@ -1159,7 +1159,7 @@ with the same number of columns in each row"
     (throw (Exception. (str "Unsupported type:" (type item))))))
 
 
-(defn blas-axpy
+(defn blas-axpy!
   "y gets ax + y.  x, y are abstract views and alpha is a double"
   [^double alpha x ^AbstractView y]
   (let [^AbstractView x (to-netlib x)
@@ -1211,7 +1211,7 @@ with the same number of columns in each row"
   (add-scaled! [m a factor]
     (if (ma/scalar? a)
       (mp/matrix-add! m (* ^double a ^double factor))
-      (blas-axpy factor a m))))
+      (blas-axpy! factor a m))))
 
 
 (extend-protocol mp/PAddScaled
@@ -1219,7 +1219,13 @@ with the same number of columns in each row"
   (add-scaled [m a factor]
     (mp/add-scaled! (clone-abstract-view m) a factor)))
 
-(defonce ones-data (atom (new-dense-vector 1000)))
+(defn make-ones-data
+  [new-len]
+  (let [^DenseVector new-data (new-dense-vector new-len)]
+    (java.util.Arrays/fill ^doubles (.data new-data) 1.0)
+    new-data))
+
+(defonce ones-data (atom (make-ones-data 1000)))
 
 (defn ones
   "Array of ones of length m.  Don't assign to this or you get what you get."
@@ -1231,9 +1237,7 @@ with the same number of columns in each row"
       (let [current-len (.length current-ones)]
         (if (> ones-len current-len)
           (let [new-len (* 2 ones-len)
-                ^DenseVector new-data (new-dense-vector new-len)]
-            (println "creating new ones!")
-            (java.util.Arrays/fill ^doubles (.data new-data) 0 new-len 1.0)
+                new-data (make-ones-data new-len)]
             (compare-and-set! ones-data current-ones new-data)
             (recur @ones-data))
           (ma/subvector current-ones 0 ones-len))))))
@@ -1245,14 +1249,14 @@ with the same number of columns in each row"
     (if (ma/scalar? a)
       (let [^AbstractView m m
             ^double a a]
-        (blas-axpy a (ones m) m))
-      (blas-axpy 1.0 a m)))
+        (blas-axpy! a (ones m) m))
+      (blas-axpy! 1.0 a m)))
   (matrix-sub! [m a]
     (if (ma/scalar? a)
       (let [^AbstractView m m
             a (* -1.0 ^double a)]
-        (blas-axpy a (ones m) m))
-      (blas-axpy -1.0 a m))))
+        (blas-axpy! a (ones m) m))
+      (blas-axpy! -1.0 a m))))
 
 (extend-protocol mp/PMatrixAdd
   AbstractView
@@ -1442,7 +1446,7 @@ return true if they overlap"
         (mp/scale! c b))
       (do
         (mp/scale! c beta)
-        (blas-axpy b a c)))
+        (blas-axpy! b a c)))
     c))
 
 
@@ -1576,6 +1580,78 @@ return true if they overlap"
     (assign-source-to-view! yd y)
     y))
 
+(defn non-blas-element-multiply!
+  [alpha a x beta y]
+  (let [^StridedView a-view (.getStridedView ^AbstractView (to-netlib a))
+        ^StridedView x-view (.getStridedView ^AbstractView (to-netlib x))
+        ^StridedView y-view (.getStridedView ^AbstractView y)
+        alpha (double alpha)
+        beta (double beta)]
+    (if (= 0.0 beta)
+      (do
+        ;;Assign to the overlapping views.  This takes care of identity
+        ;;And non pathological cases.
+        (if (are-strided-views-overlapping? y-view a-view)
+          (assign-strided-view! y-view a-view)
+          (assign-strided-view! y-view x-view))
+
+        (let [src-view (if (are-strided-views-overlapping? y-view a-view)
+                         x-view
+                         a-view)
+              dest-len (get-strided-view-data-length y-view)
+              src-len (get-strided-view-data-length src-view)
+              num-ops (quot dest-len src-len)
+              op-len src-len]
+          (loop [idx 0]
+            (when (< idx num-ops)
+              (strided-op (create-sub-strided-view y-view (* idx op-len) op-len)
+                          src-view
+                          (fn [y-data y-offset x-data x-offset op-len]
+                            (let [^doubles y-data y-data
+                                  ^long y-offset y-offset
+                                  ^doubles x-data x-data
+                                  ^long x-offset x-offset
+                                  ^long op-len op-len]
+                              (loop [idx 0]
+                                (when (< idx op-len)
+                                 (let [y-offset (+ idx y-offset)
+                                       x-offset (+ idx x-offset)]
+                                   (aset y-data y-offset
+                                         (* alpha
+                                            (aget y-data y-offset)
+                                            (aget x-data x-offset))))
+                                 (recur (inc idx)))))))
+              (recur (inc idx))))))
+      (do
+        (if (and (is-strided-view-dense? a-view)
+                 (is-strided-view-dense? x-view)
+                 (is-strided-view-dense? y-view))
+          (let [data-len (get-strided-view-data-length y-view)
+                a-offset (get-strided-view-total-offset a-view 0)
+                a-len (get-strided-view-data-length a-view)
+                x-offset (get-strided-view-total-offset x-view 0)
+                x-len (get-strided-view-data-length x-view)
+                y-offset (get-strided-view-total-offset y-view 0)
+                ^doubles a-data (.data a-view)
+                ^doubles x-data (.data x-view)
+                ^doubles y-data (.data y-view)]
+            (loop [idx 0]
+              (when (< idx data-len)
+                (let [y-offset (+ y-offset idx)
+                      x-offset (rem (+ x-offset idx)
+                                    x-len)
+                      a-offset (rem (+ a-offset idx)
+                                    a-len)]
+                  (aset y-data y-offset
+                        (+ (* beta (aget y-data y-offset))
+                           (* alpha (aget x-data x-offset)
+                              (aget a-data a-offset)))))
+                (recur (inc idx)))))
+          (let [temp-item (clone-abstract-view y)]
+            (non-blas-element-multiply! alpha a x 0.0 temp-item)
+            (blas-axpy! beta temp-item y)))))
+    y))
+
 
 
 (defmulti typed-element-multiply! (fn [m a result alpha beta]
@@ -1584,12 +1660,12 @@ return true if they overlap"
 
 (defmethod typed-element-multiply! [:matrix :matrix]
   [m a result alpha beta]
-  (blas-element-multiply! alpha m a beta result))
+  (non-blas-element-multiply! alpha m a beta result))
 
 (defmethod typed-element-multiply! [:matrix :vector]
   [m a result alpha beta]
   (doall (map (fn [m-row res-row]
-                (blas-element-multiply! alpha m-row a beta res-row))
+                (non-blas-element-multiply! alpha m-row a beta res-row))
               m
               result))
   result)
@@ -1597,7 +1673,7 @@ return true if they overlap"
 
 (defmethod typed-element-multiply! [:vector :vector]
   [a b result alpha beta]
-  (blas-element-multiply! alpha b a beta result))
+  (non-blas-element-multiply! alpha b a beta result))
 
 
 (defmethod typed-element-multiply! [:vector :matrix]
@@ -1625,7 +1701,7 @@ return true if they overlap"
   (element-multiply! [m a]
     (if (ma/scalar? a)
       (ma/scale! m a)
-      (assign-source-to-view! (typed-element-multiply! m (to-netlib a) (clone-abstract-view m)
+      (assign-source-to-view! (typed-element-multiply! (to-netlib a) m m
                                                        1.0 0.0)
                               m))))
 
