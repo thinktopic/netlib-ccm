@@ -1637,15 +1637,10 @@ return true if they overlap"
                 ^doubles y-data (.data y-view)]
             (loop [idx 0]
               (when (< idx data-len)
-                (let [y-offset (+ y-offset idx)
-                      x-offset (rem (+ x-offset idx)
-                                    x-len)
-                      a-offset (rem (+ a-offset idx)
-                                    a-len)]
-                  (aset y-data y-offset
-                        (+ (* beta (aget y-data y-offset))
-                           (* alpha (aget x-data x-offset)
-                              (aget a-data a-offset)))))
+                (aset y-data (+ idx y-offset)
+                      (+ (* beta (aget y-data (+ idx y-offset)))
+                         (* alpha (aget x-data (+ idx x-offset))
+                            (aget a-data (+ idx a-offset)))))
                 (recur (inc idx)))))
           (let [temp-item (clone-abstract-view y)]
             (non-blas-element-multiply! alpha a x 0.0 temp-item)
@@ -1769,6 +1764,18 @@ return true if they overlap"
 (extend-protocol mp/PElementCount
   AbstractView
   (element-count [m] (get-strided-view-data-length (.getStridedView ^AbstractView m))))
+
+
+(extend-protocol mp/PMathsFunctions
+  AbstractView
+  (sqrt! [m]
+    (strided-op (.getStridedView ^AbstractView m)
+                (fn [^doubles data ^long offset ^long len]
+                  (loop [idx 0]
+                    (when (< idx len)
+                      (aset data (+ idx offset) (Math/sqrt (aget data (+ idx offset))))
+                      (recur (inc idx))))
+))))
 
 
 (def empty-vec (new-dense-vector 0))
