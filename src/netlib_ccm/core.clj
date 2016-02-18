@@ -1610,16 +1610,16 @@ return true if they overlap"
         ^long a-offset a-offset
         ^long x-offset x-offset
         ^long y-offset y-offset
+        ^double alpha alpha
+        ^double beta beta
         ^doubles a-data a-data
         ^doubles x-data x-data
         ^doubles y-data y-data]
-    (loop [idx 0]
-      (when (< idx data-len)
-        (aset y-data (+ idx y-offset)
-              (+ (* beta (aget y-data (+ idx y-offset)))
-                 (* alpha (aget x-data (+ idx x-offset))
-                    (aget a-data (+ idx a-offset)))))
-        (recur (inc idx))))))
+    (dotimes [idx data-len]
+      (aset y-data (+ idx y-offset)
+            (+ (* beta (aget y-data (+ idx y-offset)))
+               (* alpha (aget x-data (+ idx x-offset))
+                  (aget a-data (+ idx a-offset))))))))
 
 (defn non-blas-element-multiply!
   [alpha a x beta y]

@@ -187,7 +187,7 @@
 
 (defn perf-test-element-multiply
   []
-  (doseq [elem-count [10 100 1000 10000 100000 1000000]]
+  (doseq [elem-count [10 100 1000 10000 100000]]
     (println "elem-count" elem-count)
     (let [^netlib_ccm.core.DenseVector y (m/array :netlib (repeat elem-count 1))
           ^netlib_ccm.core.DenseVector x (m/array :netlib (repeat elem-count 2))
