@@ -1606,12 +1606,12 @@ return true if they overlap"
 
 (defn dense-element-multiply!
   [alpha a-data a-offset x-data x-offset beta y-data y-offset op-len]
-  (let [^long data-len op-len
-        ^long a-offset a-offset
-        ^long x-offset x-offset
-        ^long y-offset y-offset
-        ^double alpha alpha
-        ^double beta beta
+  (let [data-len (long op-len)
+        a-offset (long a-offset)
+        x-offset (long x-offset)
+        y-offset (long y-offset)
+        alpha (double alpha)
+        beta (double beta)
         ^doubles a-data a-data
         ^doubles x-data x-data
         ^doubles y-data y-data]

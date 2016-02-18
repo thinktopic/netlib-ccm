@@ -7,8 +7,8 @@
                  [net.mikera/core.matrix "0.49.0"]
                  [com.github.fommil.netlib/all "1.1.2" :extension "pom"]]
 
+  :plugins [[lein-nodisassemble "0.1.3"]]
+
   :java-source-paths ["java"]
 
-  :profiles { :dev { :dependencies [[org.clojure/tools.namespace "0.2.11"]]}}
-
-  )
+  :profiles { :dev { :dependencies [[org.clojure/tools.namespace "0.2.11"]]}})
