@@ -1,9 +1,11 @@
 (ns netlib-ccm.core
   (:require [clojure.core.matrix :as ma]
             [clojure.core.matrix.protocols :as mp]
+            [clojure.core.matrix.impl.mathsops :as mathsops]
             [clojure.core.matrix.implementations :as mi]
             [clojure.pprint])
-  (:import [com.github.fommil.netlib BLAS]))
+  (:import [com.github.fommil.netlib BLAS]
+           [netlib_ccm Ops]))
 
 
 (set! *warn-on-reflection* true)
@@ -221,6 +223,36 @@ and has no offset meaning it is accurately and completely represented by
                (op (.data lhs) lhs-total-offset row-len))))
          (recur (inc lhs-row)))))
    lhs))
+
+(defmacro strided-view-binary-java-op!
+  [lhs rhs & body]
+  `(let [lhs-len# (get-strided-view-data-length ~lhs)
+         rhs-len# (get-strided-view-data-length ~rhs)]
+     ;;no op
+     (when-not (= 0 rhs-len#)
+       (when-not (= 0 (rem lhs-len# rhs-len#))
+         (throw (Exception. "Strided assignment: rhs-len not even multiple of lhs-len")))
+       (if (= 1 rhs-len#)
+         (let [^"doubles" rhs-data# (.data ~rhs)
+               ~'rhs-value (aget rhs-data#
+                                 (get-strided-view-total-offset ~rhs 0))
+               single-op# (reify netlib_ccm.IUnaryOp
+                            (op [this# ^"double" ~'lhs-value]
+                              ~@body))]
+           (strided-op ~lhs (fn [data# offset# len#]
+                              (Ops/OpY len# data# offset# single-op#))))
+         (let [num-reps# (quot lhs-len# rhs-len#)
+               multi-op# (reify netlib_ccm.IBinaryOp
+                           (op [this# ^"double" ~'rhs-value ^"double" ~'lhs-value]
+                             ~@body))]
+           (loop [rep# 0]
+             (when (< rep# num-reps#)
+               (strided-op (create-sub-strided-view ~lhs (* rep# rhs-len#) rhs-len#)
+                           ~rhs (fn [lhs-data# lhs-offset# rhs-data# rhs-offset# op-len#]
+                                  (Ops/OpXY op-len# rhs-data# rhs-offset# lhs-data# lhs-offset#
+                                            multi-op#)))
+               (recur (inc rep#)))))))
+     ~lhs))
 
 
 (defn strided-view-multiple-op!
@@ -995,15 +1027,18 @@ with the same number of columns in each row"
     (new-dense-vector (.length ^AbstractVector view))))
 
 
+(defmacro unary-op-macro!
+  [view & body]
+  `(let [^"StridedView" view# (.getStridedView ^AbstractView ~view)
+         ^"IUnaryOp" local-op# (reify netlib_ccm.IUnaryOp
+                                 (op[this# ~'lhs-value]
+                                   ~@body))]
+     (strided-op view# (fn [data# offset# len#]
+                         (Ops/OpY len# data# offset# local-op#)))))
+
 (defn unary-op!
   [^AbstractView view op]
-  (let [^StridedView view (.getStridedView view)]
-    (strided-op view (fn [^doubles data ^long offset ^long len]
-                       (loop [idx 0]
-                         (when (< idx len)
-                           (let [offset (+ offset idx)]
-                             (aset data offset (double (op (aget data offset)))))
-                           (recur (inc idx))))))))
+  (unary-op-macro! view (op lhs-value)))
 
 
 ;;All unary operators
@@ -1017,23 +1052,9 @@ with the same number of columns in each row"
 (defn binary-op!
   "lhs gets (op lhs rhs)"
   [^AbstractView lhs ^AbstractView rhs op]
-  (let [single-val-op (fn [^doubles data ^long offset ^long len ^double rhs-val]
-                        (loop [idx 0]
-                          (when (< idx len)
-                            (let [offset (+ offset idx)]
-                              (aset data offset (double (op (aget data offset) rhs-val))))
-                            (recur (inc idx)))))
-        multiple-val-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
-                          (loop [idx 0]
-                            (when (< idx ^long op-len)
-                              (let [lhs-offset (+ ^long lhs-offset idx)
-                                    rhs-offset (+ ^long rhs-offset idx)
-                                    lhs-val (aget ^doubles lhs-data lhs-offset)
-                                    rhs-val (aget ^doubles rhs-data rhs-offset)]
-                                (aset ^doubles lhs-data lhs-offset (double (op lhs-val rhs-val))))
-                              (recur (inc idx)))))]
-    (strided-view-multiple-op! (.getStridedView lhs) (.getStridedView rhs) multiple-val-op single-val-op))
-  lhs)
+  (let [^StridedView rhs-view (.getStridedView rhs)
+        ^StridedView lhs-view (.getStridedView lhs)]
+    (strided-view-binary-java-op! lhs-view rhs-view (op lhs-value rhs-value))))
 
 
 (defn binary-immutable-op
@@ -1185,13 +1206,10 @@ with the same number of columns in each row"
                             ^long op-len op-len]
                         ;;Found through some perf testing.  Probably different ratios
                         ;;on other architectures.
-                        (if (< op-len 40)
-                          (loop [idx 0]
-                            (when (< idx op-len)
-                              (aset y-data (+ y-offset idx)
-                                    (+ (* alpha (aget x-data (+ x-offset idx)))
-                                       (aget y-data (+ y-offset idx))))
-                              (recur (inc idx))))
+                        (if (< op-len 150)
+                          (Ops/axpy op-len alpha
+                                    x-data x-offset
+                                    y-data y-offset)
                           (.daxpy (BLAS/getInstance) op-len alpha
                                   ^doubles x-data ^long x-offset 1
                                   ^doubles y-data ^long y-offset 1))))]
@@ -1476,17 +1494,23 @@ return true if they overlap"
                                             [(get-arg-mat-type a)
                                              (get-arg-mat-type b)]))
 
-(defn get-item-shape-result
-  (^long [trans? ^long row-count ^long column-count rows-or-columns]
-   (if trans?
-     (if (= :row-count rows-or-columns)
-       column-count
-       row-count)
-     (if (= :row-count rows-or-columns)
-       row-count
-       column-count)))
+(defn get-item-vector-shape-result
+  (^long [trans? ^long vector-length rows-or-columns]
+   (if-not trans?
+     1
+     vector-length)))
+
+(defn get-item-matrix-shape-result
   (^long [trans? shape rows-or-columns]
-   (get-item-shape-result trans? (shape 0) (shape 1) rows-or-columns)))
+   (let [^long row-count (shape 0)
+         ^long column-count (shape 1)]
+     (if trans?
+       (if (= :row-count rows-or-columns)
+         column-count
+         row-count)
+       (if (= :row-count rows-or-columns)
+         row-count
+         column-count)))))
 
 
 (defn get-item-shape
@@ -1494,10 +1518,10 @@ return true if they overlap"
   ^long [trans? item rows-or-columns]
   (let [mat-type (get-arg-mat-type item)]
     (cond
-      (= mat-type :matrix) (get-item-shape-result trans? (ma/shape item)
+      (= mat-type :matrix) (get-item-matrix-shape-result trans? (ma/shape item)
                                                   rows-or-columns)
-      (= mat-type :vector) (get-item-shape-result trans? (.length ^AbstractVector item) 1
-                                                  rows-or-columns)
+      (= mat-type :vector) (get-item-vector-shape-result trans? (.length ^AbstractVector item)
+                                                         rows-or-columns)
       :else 1)))
 
 
@@ -1580,6 +1604,23 @@ return true if they overlap"
     (assign-source-to-view! yd y)
     y))
 
+(defn dense-element-multiply!
+  [alpha a-data a-offset x-data x-offset beta y-data y-offset op-len]
+  (let [^long data-len op-len
+        ^long a-offset a-offset
+        ^long x-offset x-offset
+        ^long y-offset y-offset
+        ^doubles a-data a-data
+        ^doubles x-data x-data
+        ^doubles y-data y-data]
+    (loop [idx 0]
+      (when (< idx data-len)
+        (aset y-data (+ idx y-offset)
+              (+ (* beta (aget y-data (+ idx y-offset)))
+                 (* alpha (aget x-data (+ idx x-offset))
+                    (aget a-data (+ idx a-offset)))))
+        (recur (inc idx))))))
+
 (defn non-blas-element-multiply!
   [alpha a x beta y]
   (let [^StridedView a-view (.getStridedView ^AbstractView (to-netlib a))
@@ -1612,15 +1653,7 @@ return true if they overlap"
                                   ^doubles x-data x-data
                                   ^long x-offset x-offset
                                   ^long op-len op-len]
-                              (loop [idx 0]
-                                (when (< idx op-len)
-                                 (let [y-offset (+ idx y-offset)
-                                       x-offset (+ idx x-offset)]
-                                   (aset y-data y-offset
-                                         (* alpha
-                                            (aget y-data y-offset)
-                                            (aget x-data x-offset))))
-                                 (recur (inc idx)))))))
+                              (Ops/alphaAY op-len alpha x-data x-offset y-data y-offset))))
               (recur (inc idx))))))
       (do
         (if (and (is-strided-view-dense? a-view)
@@ -1635,13 +1668,12 @@ return true if they overlap"
                 ^doubles a-data (.data a-view)
                 ^doubles x-data (.data x-view)
                 ^doubles y-data (.data y-view)]
-            (loop [idx 0]
-              (when (< idx data-len)
-                (aset y-data (+ idx y-offset)
-                      (+ (* beta (aget y-data (+ idx y-offset)))
-                         (* alpha (aget x-data (+ idx x-offset))
-                            (aget a-data (+ idx a-offset)))))
-                (recur (inc idx)))))
+            (Ops/alphaAXPlusBetaY data-len alpha
+                                  a-data a-offset
+                                  x-data x-offset
+                                  beta
+                                  y-data
+                                  y-offset))
           (let [temp-item (clone-abstract-view y)]
             (non-blas-element-multiply! alpha a x 0.0 temp-item)
             (blas-axpy! beta temp-item y)))))
@@ -1719,7 +1751,10 @@ return true if they overlap"
     ([m] (mp/element-map! m /))
     ([m a] (if (ma/scalar? a)
              (ma/scale! m (/ 1.0 (double a)))
-             (binary-op! m a /)))))
+             (let [m-view (.getStridedView ^AbstractView m)
+                   a-view (.getStridedView ^AbstractView a)]
+               (strided-view-binary-java-op! m-view a-view
+                                             (/ lhs-value rhs-value)))))))
 
 
 (extend-protocol mp/PMatrixDivide
@@ -1766,17 +1801,28 @@ return true if they overlap"
   (element-count [m] (get-strided-view-data-length (.getStridedView ^AbstractView m))))
 
 
-(extend-protocol mp/PMathsFunctions
-  AbstractView
-  (sqrt! [m]
-    (strided-op (.getStridedView ^AbstractView m)
-                (fn [^doubles data ^long offset ^long len]
-                  (loop [idx 0]
-                    (when (< idx len)
-                      (aset data (+ idx offset) (Math/sqrt (aget data (+ idx offset))))
-                      (recur (inc idx))))
-))))
 
+(eval
+ `(extend-protocol mp/PMathsFunctionsMutable
+    AbstractView
+    ~@(map
+        (fn [[fname op]]
+          (let [fname (symbol (str fname "!"))]
+            `(~fname [~'m] (unary-op-macro! ~'m (~op ~'lhs-value)))))
+        mathsops/maths-ops)))
+
+
+(defmacro maths-ops
+  []
+  `(extend-protocol mp/PMathsFunctions
+     AbstractView
+     ~@(map
+         (fn [[fname op]]
+           `(~fname [m#] (let [^AbstractView m# (clone-abstract-view m#)]
+                            (unary-op-macro! m# (~op ~'lhs-value)))))
+         mathsops/maths-ops)))
+
+(maths-ops)
 
 (def empty-vec (new-dense-vector 0))
 (mi/register-implementation empty-vec)

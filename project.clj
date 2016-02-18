@@ -7,6 +7,8 @@
                  [net.mikera/core.matrix "0.49.0"]
                  [com.github.fommil.netlib/all "1.1.2" :extension "pom"]]
 
+  :java-source-paths ["java"]
+
   :profiles { :dev { :dependencies [[org.clojure/tools.namespace "0.2.11"]]}}
 
   )
