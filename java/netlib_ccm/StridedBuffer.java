@@ -118,102 +118,113 @@ public class StridedBuffer
 	    + (data_rest % column_count);
     }
 
-    public bool isDense()
+    public boolean isDense()
     {
 	return (1 == row_count) || (column_count == row_stride);
     }
 
-    public bool isCompleteDense()
+    public boolean isCompleteDense()
     {
 	return isDense()
 	    && (offset == 0)
-	    && (.length data) == getViewDataLength();
+	    && data.length == getDataLength();
     }
 
-    public StridedBuffer createSubStridedBuffer( int sub_offset, int length )
+
+    public int getLongestContiguousLength( int data_offset ) throws Exception
+    {
+	if (isDense())
+	    return Math.max(0, getDataLength() - data_offset);
+
+	return getRowLengthFromDataOffset( data_offset );
+    }
+
+    public StridedBuffer createSubStridedBuffer( int sub_offset, int length ) throws Exception
     {
 	if ( length == 0 )
-	    return new StridedBuffer( data, 0, 0 );
+	    return new StridedBuffer( data, offset, 0 );
 
-	if ( length == getDataLength()
+	int data_len = getDataLength();
+
+	if ( length == data_len
 	     && sub_offset == 0 )
 	    return this;
 	checkDataOffset( sub_offset );
 	checkDataOffset( sub_offset + (length - 1));
-	int data_len = getDataLength();
-	int first_row_len = 0;
-	if ( sub_offset < initial_column_count ) {
-	    first_row_len = initial_column_count - sub_offset;
-	}
-	else {
-	    first_row_len = column_count - ((sub_offset - initial_column_count) % column_count);
-	}
-	int first_row_offset = column_count - first_row_len;
 
-	if ( length < first_row_len )
+	int initial_row_len = getLongestContiguousLength( sub_offset );
+	if ( initial_row_len >= length )
 	    return new StridedBuffer( data, getTotalOffset( sub_offset ), length );
 
-	int row_idx = getRowFromDataOffset(sub_offset);
-	int last_row_len = ((first_row_offset + length) % column_count);
-	int ary_offset (offset + (row_stride * row-idx));
-	int body_num_rows = ((length - (first_row_len + last_row_len)) / column_count);
+	int rest_len = length - initial_row_len;
+	int num_body_rows  = rest_len / column_count;
+	int last_row_len = rest_len % column_count;
+	int start_data_offset = column_count - initial_column_count;
+	int start_offset = getTotalOffset( sub_offset ) - start_data_offset;
+	int num_rows = num_body_rows;
+	if (initial_row_len > 0)
+	    num_rows++;
+	if (last_row_len > 0)
+	    num_rows++;
 
-	int ini_row = 0;
-	if ( first_row_len != 0 ) ini_row = 1;
-
-	int end_row = 1;
-	return new StridedBuffer( data, ary_offset
-				  , (body_num_rows + ini_row + end_row)
+	return new StridedBuffer( data, start_offset, num_rows
 				  , column_count
 				  , row_stride
-				  , first_row_len
+				  , initial_row_len
 				  , last_row_len );
     }
 
-    public void stridedOperation( StridedBuffer rhs, IStridedBinaryOp op ) throws Exception
+    public void unaryOperation( IStridedUnaryOp op ) throws Exception
+    {
+	int total_op_len = getDataLength();
+	int total_op_offset = 0;
+	while( total_op_offset < total_op_len ) {
+	    int current_op_len = getLongestContiguousLength(total_op_offset);
+	    op.op( data, getTotalOffset( total_op_offset ), current_op_len );
+	    total_op_offset += current_op_len;
+	}
+    }
+
+    public void binaryOperation( StridedBuffer rhs, IStridedBinaryOp op ) throws Exception
     {
 	if ( getDataLength() == 0
 	     || rhs.getDataLength() == 0 )
 	    return;
-	int num_ops = getDataLength / rhs.getDataLength();
-	int op_len = rhs.getDataLength();
-	bool are_both_dense = isDense() && rhs.isDense();
-	bool rhs_dense = rhs.isDense();
-	for ( int op_idx = 0; op_idx < num_ops; ++op_idx ) {
-	    int lhs_offset = op_len * op_idx;
+	int total_op_len = getDataLength();
+	int rhs_len = rhs.getDataLength();
+	int total_op_offset = 0;
+	while( total_op_offset < total_op_len ) {
+	    int rhs_op_offset = total_op_offset % rhs_len;
+	    int current_op_len = Math.min( getLongestContiguousLength(total_op_offset)
+					   , rhs.getLongestContiguousLength(rhs_op_offset) );
+	    op.op( data, getTotalOffset(total_op_offset)
+		   , rhs.data, rhs.getTotalOffset( rhs_op_offset )
+		   , current_op_len );
+	    total_op_offset += current_op_len;
+	}
+    }
 
-	    if ( are_both_dense ) {
-		op.op( data, getTotalOffset(lhs_offset), rhs.data, rhs.getTotalOffset( 0 ), op_len );
-	    }
-	    else {
-		if ( rhs_dense ) {
-		    int rhs_offset = 0;
-		    //Iterate lhs rows because rhs is dense
-		    for ( int lhs_row = getRowFromDataOffset(lhs_offset);
-			  lhs_row < row_count && rhs_offset < op_len; ++lhs_row ) {
-			int lhs_row_len = getRowLengthFromDataOffset(lhs_offset + rhs_offset);
-			int max_possible = op_len - rhs_offset;
-			int copy_len = Math.min(lhs_row_len, max_possible);
-			op( data, getTotalOffset( lhs_offset + rhs_offset ),
-			    rhs.data, rhs.getTotalOffset( rhs_offset ),
-			    copy_len );
-			rhs_offset += copy_len;
-		    }
-		}
-		else {
-		    //Harder case, iterate rhs rows because both may be strided
-		    int rhs_offset = 0;
-		    while( rhs_offset < op_len ) {
-			int rhs_row_len = getRowLengthFromDataOffset( rhs_offset );
-			int lhs_row_len = getRowLengthFromDataOffset( lhs_offset + rhs_offset );
-			int copy_len = Math.min( rhs_row_len, lsh_row_len );
-			op( data, getTotalOffset( lhs_offset + rhs_offset )
-			    , rhs.data, rhs.getTotalOffset( rhs_offset )
-			    , copy_len );
-			rhs_offset += copy_len;
-		    }
-		}
-	    }
+    public void ternaryOperation( StridedBuffer middle, StridedBuffer rhs, IStridedTernaryOp op ) throws Exception
+    {
+	if ( getDataLength() == 0
+	     || middle.getDataLength() == 0
+	     || rhs.getDataLength() == 0 )
+	    return;
+	int total_op_len = getDataLength();
+	int middle_len = middle.getDataLength();
+	int rhs_len = rhs.getDataLength();
+	int total_op_offset = 0;
+	while( total_op_offset < total_op_len ) {
+	    int middle_op_offset = total_op_offset % middle_len;
+	    int rhs_op_offset = total_op_offset % rhs_len;
+	    int current_op_len = Math.min( getLongestContiguousLength(total_op_offset)
+					   , Math.min( middle.getLongestContiguousLength( middle_op_offset )
+						       , rhs.getLongestContiguousLength( rhs_op_offset ) ) );
+	    op.op( data, getTotalOffset( total_op_offset )
+		   , middle.data, middle.getTotalOffset( middle_op_offset )
+		   , rhs.data, rhs.getTotalOffset( rhs_op_offset )
+		   , current_op_len );
+	    total_op_offset += current_op_len;
 	}
     }
 }
