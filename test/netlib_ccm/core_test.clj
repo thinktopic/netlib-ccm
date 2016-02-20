@@ -1,11 +1,14 @@
 (ns netlib-ccm.core-test
   (:require [clojure.test :refer :all]
             [netlib-ccm.core :as nc]
+            [netlib-ccm.strided-view :as sv]
             [clojure.core.matrix :as m]
             [clojure.core.matrix.protocols :as mp]
             [clojure.tools.namespace.repl :as r])
   (:import [com.github.fommil.netlib BLAS]
-           [netlib_ccm Ops]))
+           [netlib_ccm Ops StridedBuffer IUnaryOp IStridedUnaryOp
+            IBinaryOp IStridedBinaryOp]
+           [netlib_ccm.strided_view StridedView]))
 
 
 
@@ -262,7 +265,7 @@
           x-view (.getStridedView x)]
       (print "closure:")
       (time (dotimes [iter 1000]
-              (nc/strided-view-multiple-op! y-view
+              (sv/strided-view-multiple-op! y-view
                                             x-view
                                             (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
                                               (Ops/OpXY op-len rhs-data rhs-offset
@@ -278,5 +281,163 @@
                                                            (/ lhs-val rhs-val))))))))
       (print "macro   :")
       (time (dotimes [iter 1000]
-              (nc/strided-view-binary-java-op! y-view x-view (/ lhs-value rhs-value))))))
+              (sv/strided-view-binary-java-op! y-view x-view (/ lhs-value rhs-value))))))
   )
+
+
+(defn get-padded-strided-dimension
+  "http://caffe.berkeleyvision.org/tutorial/layers.html.  Returns the dimensions
+of the output of a conv-net ignoring channels."
+  ^long [^long input-dim ^long pad ^long kernel-size ^long stride]
+  (long (+ (quot (- (+ input-dim (* 2 pad))  kernel-size)
+                 stride)
+           1)))
+;;Compare the java strided buffer and the clojure strided view and ensure they
+;;both return same results when doing a hard operation such as rolling up and summing
+;;convolution matrix
+(defn create-java-convolution-views
+  [src-dim src-chan-count kern-dim]
+  (let [^StridedBuffer backing-store (StridedBuffer/create (* src-dim src-dim src-chan-count))
+        output-dim (get-padded-strided-dimension src-dim 0 kern-dim 1)
+        input-stride (* src-dim src-chan-count)]
+    [(.data backing-store)
+     (flatten
+      (for [output-y (range output-dim)
+            output-x (range output-dim)]
+        (let [input-left (* output-x 1)
+              input-top (* output-y 1)
+              input-start-offset (+ (* input-stride input-top) input-left)
+              input-actual-offset (StridedBuffer/getTotalOffset
+                                   backing-store input-start-offset)]
+          (StridedBuffer. (.data backing-store)
+                          input-actual-offset kern-dim kern-dim input-stride
+                          kern-dim kern-dim))))]))
+
+
+(defn create-clojure-convolution-views
+  [src-dim src-chan-count kern-dim]
+  (let [^StridedView backing-store
+        (sv/new-strided-view (make-array Double/TYPE (* src-dim src-dim src-chan-count))
+                             0 (* src-dim src-dim src-chan-count))
+        output-dim (get-padded-strided-dimension src-dim 0 kern-dim 1)
+        input-stride (* src-dim src-chan-count)]
+    [(.data backing-store)
+     (flatten
+       (for [output-y (range output-dim)
+             output-x (range output-dim)]
+         (let [input-left (* output-x 1)
+               input-top (* output-y 1)
+               input-start-offset (+ (* input-stride input-top) input-left)
+               input-actual-offset (sv/get-strided-view-total-offset backing-store
+                                                                     input-start-offset)]
+           (sv/new-strided-view (.data backing-store)
+                                input-actual-offset kern-dim kern-dim input-stride
+                                kern-dim kern-dim))))]))
+
+
+(deftest convolution-test
+  (testing "Ensure java conv buffer and clojure conv buffer agree"
+    (let [[^doubles j-buffer j-views] (create-java-convolution-views 3 1 2)
+          [^doubles c-buffer c-views] (create-clojure-convolution-views 3 1 2)
+          increment-op (reify IUnaryOp
+                         (op [this val] (+ val 1.0)))]
+      (doseq [j-view j-views]
+        (StridedBuffer/unaryOperation j-view
+                                      (reify IStridedUnaryOp
+                                        (op [this lhs-data lhs-offset op-len]
+                                          (Ops/OpY op-len lhs-data lhs-offset increment-op)))))
+      (doseq [c-view c-views]
+        (sv/strided-op c-view (fn [lhs-data lhs-offset op-len]
+                                (Ops/OpY op-len lhs-data lhs-offset increment-op))))
+      (is (m/equals j-buffer c-buffer)))))
+
+
+(defn unary-convolution-perftest
+  []
+  (doseq [src-dim [32 64 128 256 512]
+          src-chan-count [1 3 20 40]]
+    (let [[j-buffer j-views] (create-java-convolution-views src-dim src-chan-count 5)
+          [c-buffer c-views] (create-clojure-convolution-views src-dim src-chan-count 5)
+          increment-op (reify IUnaryOp
+                         (op [this val] (+ val 1.0)))
+          unary-op (reify IStridedUnaryOp
+                     (op [this lhs-data lhs-offset op-len]
+                       (Ops/OpY op-len lhs-data lhs-offset increment-op)))
+          c-view-op (fn [lhs-data lhs-offset op-len]
+                      (Ops/OpY op-len lhs-data lhs-offset increment-op))
+          iter-count 1000]
+      (println (format "src-dim %d src-chan-count %d" src-dim src-chan-count))
+      (print "java    :")
+      (time (dotimes [iter iter-count]
+              (doseq [j-view j-views]
+                (StridedBuffer/unaryOperation j-view unary-op))))
+
+      (print "clojure :")
+      (time (dotimes [iter iter-count]
+              (doseq [c-view c-views]
+                (sv/strided-op c-view c-view-op))))
+
+      (print "javathis:")
+      (time (dotimes [iter iter-count]
+              (doseq [j-view j-views]
+                (.unaryOperation j-view unary-op)))))))
+
+(defn binary-convolution-perftest
+  []
+  (doseq [src-dim [32 64 128 256 512]
+          src-chan-count [1 3 20 40]]
+    (let [[j-buffer j-views] (create-java-convolution-views src-dim src-chan-count 5)
+          [c-buffer c-views] (create-clojure-convolution-views src-dim src-chan-count 5)
+          data-len (StridedBuffer/getDataLength (first j-views))
+          ^StridedBuffer j-rhs-view (StridedBuffer/create data-len)
+          ^StridedView c-rhs-view (.getStridedView (nc/new-dense-vector data-len))
+          increment-op (reify IBinaryOp
+                         (op [this lhs rhs] (+ lhs rhs)))
+          j-view-op (reify IStridedBinaryOp
+                      (op [this lhs-data lhs-offset rhs-data rhs-offset op-len]
+                        (Ops/OpXY op-len lhs-data lhs-offset
+                                  rhs-data rhs-offset increment-op)))
+          c-view-op (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
+                      (Ops/OpXY op-len lhs-data lhs-offset rhs-data rhs-offset increment-op))
+          iter-count 100]
+      (println (format "src-dim %d src-chan-count %d" src-dim src-chan-count))
+      (print "java    :")
+      (time (dotimes [iter iter-count]
+              (doseq [j-view j-views]
+                (StridedBuffer/binaryOperationNonLocal j-view j-rhs-view j-view-op))))
+
+      (print "javalocal:")
+      (time (dotimes [iter iter-count]
+              (doseq [j-view j-views]
+                (StridedBuffer/binaryOperation j-view j-rhs-view j-view-op))))
+
+      (print "clojure :")
+      (time (dotimes [iter iter-count]
+              (doseq [c-view c-views]
+                (sv/strided-op c-view c-rhs-view c-view-op))))
+
+      (print "javathis:")
+      (time (dotimes [iter iter-count]
+              (doseq [j-view j-views]
+                (.binaryOperation j-view j-rhs-view j-view-op)))))))
+
+
+(defn field-access-perftest
+  []
+  (dotimes [test 5]
+    (let [[j-buffer j-views] (create-java-convolution-views 32 3 5)
+          iter-count 10000
+          ^StridedBuffer j-view (first j-views)
+          initial_column_count (int (.initial_column_count j-view))
+          row_count (int (.row_count j-view))
+          last_column_count (int (.last_column_count j-view))
+          column_count (int (.column_count j-view))
+          row (int 1)]
+      (print "java fields:")
+      (time (loop [iter 0]
+              (when (< iter iter-count)
+                (StridedBuffer/getRowLengthFromRow j-view 1)
+                (recur (inc iter)))))
+
+      (print "java locals:")
+      (time (StridedBuffer/getRowLengthFromRowTest j-view 1 iter-count)))))
