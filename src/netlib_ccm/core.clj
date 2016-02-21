@@ -658,11 +658,7 @@ with the same number of columns in each row"
   (assign-source-to-view! [source m]
     (let [source (double source)
           ^AbstractView m m]
-      (if (= 0.0 source)
-        (mp/scale! m 0.0)
-        (StridedBuffer/unaryOperation (.getStridedBuffer m)
-                    (fn [^doubles data ^long offset ^long len]
-                      (java.util.Arrays/fill data offset (+ offset len) source))))
+      (.set (.getStridedBuffer m) source)
       m)))
 
 
@@ -1034,48 +1030,48 @@ with the same number of columns in each row"
 (defn blas-gemm!
   "Defaults to a being a row-matrix if a vector and b being a column-matrix if a vector"
   ([trans-a? trans-b? alpha a b beta c]
-   (when-not (and (matrix-or-vector? a)
-                  (matrix-or-vector? b))
-     (throw (Exception. "Unsupported")))
-   (let [factor (double alpha)
-         beta (double beta)
-         ^DenseMatrix a (make-dense-matrix (to-netlib a) :row)
-         ^DenseMatrix b (make-dense-matrix (to-netlib b) :column)
-         ^AbstractView c c
-         a-dims (if trans-a? [(.columnCount a) (.rowCount a)] [(.rowCount a) (.columnCount a)])
-         b-dims (if trans-b? [(.columnCount b) (.rowCount b)] [(.rowCount b) (.columnCount b)])
-         M (first a-dims)
-         N (second b-dims)
-         K (first b-dims)
-         overlapping? (or (are-abstract-views-overlapping? a c)
-                          (are-abstract-views-overlapping? b c))
-         dest (if overlapping?
-                (clone-abstract-view c)
-                c)
-         ;;C is a MxN matrix.
-         ^DenseMatrix m (cond
-                          (= 1 M) (make-dense-matrix dest :row)
-                          (= 1 N) (make-dense-matrix dest :column)
-                          :else
-                          (make-dense-matrix dest))
-         ^DenseVector a-data (.data a)
-         ^DenseVector b-data (.data b)
-         ^DenseVector m-data (.data m)
-         trans-command-a (if trans-a? "t" "n")
-         trans-command-b (if trans-b? "t" "n")]
-     (when-not (and (= K (second a-dims))
-                    (= M (.rowCount m))
-                    (= N (.columnCount m)))
-       (throw (Exception. (format "Incompatible matrix sizes: a %s b %s m %s"
-                                  (str a-dims)
-                                  (str b-dims)
-                                  (str (ma/shape m))))))
-     (.dgemm (BLAS/getInstance) trans-command-b trans-command-a N M K alpha
-             (.data b-data) (.offset b-data) (.columnCount b)
-             (.data a-data) (.offset a-data) (.columnCount a)
-             beta
-             (.data m-data) (.offset m-data) (.columnCount m))
-     (assign-source-to-view! m c)))
+   (let [^DenseMatrix a (make-dense-matrix (to-netlib a) :row)
+         ^DenseMatrix b (make-dense-matrix (to-netlib b) :column)]
+    (when-not (and (matrix-or-vector? a)
+                   (matrix-or-vector? b))
+      (throw (Exception. "Unsupported")))
+    (let [factor (double alpha)
+          beta (double beta)
+          ^AbstractView c c
+          a-dims (if trans-a? [(.columnCount a) (.rowCount a)] [(.rowCount a) (.columnCount a)])
+          b-dims (if trans-b? [(.columnCount b) (.rowCount b)] [(.rowCount b) (.columnCount b)])
+          M (first a-dims)
+          N (second b-dims)
+          K (first b-dims)
+          overlapping? (or (are-abstract-views-overlapping? a c)
+                           (are-abstract-views-overlapping? b c))
+          dest (if overlapping?
+                 (clone-abstract-view c)
+                 c)
+          ;;C is a MxN matrix.
+          ^DenseMatrix m (cond
+                           (= 1 M) (make-dense-matrix dest :row)
+                           (= 1 N) (make-dense-matrix dest :column)
+                           :else
+                           (make-dense-matrix dest))
+          ^DenseVector a-data (.data a)
+          ^DenseVector b-data (.data b)
+          ^DenseVector m-data (.data m)
+          trans-command-a (if trans-a? "t" "n")
+          trans-command-b (if trans-b? "t" "n")]
+      (when-not (and (= K (second a-dims))
+                     (= M (.rowCount m))
+                     (= N (.columnCount m)))
+        (throw (Exception. (format "Incompatible matrix sizes: a %s b %s m %s"
+                                   (str a-dims)
+                                   (str b-dims)
+                                   (str (ma/shape m))))))
+      (.dgemm (BLAS/getInstance) trans-command-b trans-command-a N M K alpha
+              (.data b-data) (.offset b-data) (.columnCount b)
+              (.data a-data) (.offset a-data) (.columnCount a)
+              beta
+              (.data m-data) (.offset m-data) (.columnCount m))
+      (assign-source-to-view! m c))))
   ([alpha a b beta c]
    (blas-gemm! false false alpha a b beta c)))
 
@@ -1398,7 +1394,7 @@ with the same number of columns in each row"
                (StridedBuffer/binaryOperationOp
                 m-view a-view
                 (reify IBinaryOp
-                  (op [this lhs-val rhs-val]
+                  (op [this rhs-val lhs-val]
                     (/ lhs-val rhs-val)))))))))
 
 

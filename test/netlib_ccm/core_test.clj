@@ -4,11 +4,13 @@
             [netlib-ccm.strided-view :as sv]
             [clojure.core.matrix :as m]
             [clojure.core.matrix.protocols :as mp]
-            [clojure.tools.namespace.repl :as r])
+            [clojure.tools.namespace.repl :as r]
+            [mikera.vectorz.core])
   (:import [com.github.fommil.netlib BLAS]
            [netlib_ccm Ops StridedBuffer IUnaryOp IStridedUnaryOp
             IBinaryOp IStridedBinaryOp]
            [netlib_ccm.strided_view StridedView]))
+
 
 
 
@@ -54,7 +56,7 @@
 (defn inner-product-perftest
   []
   (let [iterations 10]
-    (doseq [size [10 100 500]
+    (doseq [size [10 20 40 100 500]
             impl [:vectorz :netlib]]
       (println "size" size "impl" impl)
       (let [a (m/pack (m/array impl (repeat size (range 1 (+ size 1)))))
@@ -444,3 +446,48 @@ of the output of a conv-net ignoring channels."
 
       (print "java locals:")
       (time (StridedBuffer/getRowLengthFromRowTest j-view 1 iter-count)))))
+
+(defn sqrt-with-epsilon!
+  "res[i] = sqrt(vec[i] + epsilon)"
+  [output-vec squared-vec epsilon]
+  (m/assign! output-vec squared-vec)
+  (m/add! output-vec epsilon)
+  (m/sqrt! output-vec))
+
+
+(defn compute-squared-running-average!
+  [accumulator data-vec ^double decay-rate]
+  (m/mul! accumulator (- 1.0 decay-rate))
+  (m/add-scaled-product! accumulator data-vec data-vec decay-rate))
+
+
+(deftest sqrt-with-epsilon
+  (is (= (m/eseq (sqrt-with-epsilon! (m/mutable (m/array :vectorz [1 2 3]))
+                                     (m/mutable (m/array :vectorz [2 2 2]))
+                                     0.01))
+         (m/eseq (sqrt-with-epsilon! (m/array :netlib [1 2 3])
+                                     (m/array :netlib [2 2 2])
+                                     0.01)))))
+
+(deftest squared-running-average
+  (is (= (m/eseq (compute-squared-running-average! (m/mutable (m/array :vectorz [1 2 3]))
+                                                   (m/mutable (m/array :vectorz [2 2 2]))
+                                                   0.01))
+         (m/eseq (compute-squared-running-average! (m/array :netlib [1 2 3])
+                                                   (m/array :netlib [2 2 2])
+                                                   0.01)))))
+
+(defn adadelta-middle
+  [impl]
+  (let [dx (m/array impl [1 2 3])
+        gradient (m/array impl [2 2 2])
+        rms-dx (m/array impl [0.5 1.0 2.0])
+        rms-grad (m/array impl [2 2 2])]
+    (m/assign! dx gradient)
+    (m/mul! dx -1.0)
+    (m/mul! dx rms-dx)
+    (m/div! dx rms-grad)))
+
+(deftest test-adadelta-middle
+  (is (= (m/eseq (adadelta-middle :vectorz))
+         (m/eseq (adadelta-middle :netlib)))))
