@@ -234,23 +234,26 @@
 
 (defn perf-test-sqrt!
   []
-  (doseq [elem-count [10 50 100 150 200 1000 10000 100000 1000000 10000000]]
+  (doseq [elem-count [10 50 100 150 200 1000 10000 100000]]
     (println "elem-count" elem-count)
     (let [^netlib_ccm.core.DenseVector y (m/array :netlib (repeat elem-count 1))
-          ^netlib_ccm.core.DenseVector x (m/array :netlib (repeat elem-count 2))
-          ^netlib_ccm.core.DenseVector a (m/array :netlib (repeat elem-count 3))
+          a (m/mutable (m/array :vectorz (repeat elem-count 3)))
           op-len elem-count]
       (print "library:")
-      (time (dotimes [iter 1000]
+      (time (dotimes [iter 100]
               (m/sqrt! y)))
       (print "reify   :")
-      (time (dotimes [iter 1000]
+      (time (dotimes [iter 100]
               (Ops/OpY elem-count (.data y) 0 (reify netlib_ccm.IUnaryOp
                                                 (op [this input]
                                                   (Math/sqrt input))))))
       (print "macro   :")
-      (time (dotimes [iter 1000]
+      (time (dotimes [iter 100]
               (nc/unary-op-macro! y (Math/sqrt lhs-value))))
+
+      (print "vectorz   :")
+      (time (dotimes [iter 100]
+              (m/sqrt! a)))
       )))
 
 

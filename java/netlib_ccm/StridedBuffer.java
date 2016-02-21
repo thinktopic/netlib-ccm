@@ -2,7 +2,6 @@ package netlib_ccm;
 
 import java.util.Arrays;
 
-
 public final class StridedBuffer
 {
     public final double[] data;
@@ -535,6 +534,47 @@ public final class StridedBuffer
 	}
     }
 
+    public static void unaryOperationOp( StridedBuffer lhs
+					 , IUnaryOp unary_op ) throws Exception
+    {
+	unaryOperation( lhs, new IStridedUnaryOp() {
+		public void op( double[] data, int offset, int len ) {
+		    Ops.OpY( len, data, offset, unary_op );
+		}
+	    } );
+    }
+
+    public static void binaryOperationOp( StridedBuffer lhs, StridedBuffer rhs,
+					  IBinaryOp bin_op ) throws Exception
+    {
+	int lhs_len = getDataLength(lhs);
+	int rhs_len = getDataLength(rhs);
+	if ( rhs_len == 0 || lhs_len == 0 )
+	    return;
+	if ( rhs_len == 1 ) {
+	    double rhs_val = rhs.data[getTotalOffset(rhs, 0)];
+	    IUnaryOp condensed_op = new IUnaryOp() {
+		    public double op( double lhs_val ) {
+			return bin_op.op( lhs_val, rhs_val );
+		    }
+		};
+	    unaryOperation( lhs, new IStridedUnaryOp() {
+		    public void op( double[] data, int offset, int len ) {
+			Ops.OpY( len, data, offset, condensed_op );
+		    }
+		} );
+	} else {
+	    binaryOperation( lhs, rhs, new IStridedBinaryOp() {
+		    public void op( double[] lhs_data, int lhs_offset
+				    , double[] rhs_data, int rhs_offset
+				    , int op_len ) {
+			Ops.OpXY( op_len, rhs_data, rhs_offset,
+				  lhs_data, lhs_offset, bin_op );
+		    }
+		} );
+	}
+    }
+
     public void set( double value ) throws Exception
     {
 	try {
@@ -552,12 +592,18 @@ public final class StridedBuffer
     //Assign other to this
     public void assign( StridedBuffer other ) throws Exception
     {
-	binaryOperation( other, new IStridedBinaryOp() {
-		public void op( double[] lhs, int lhs_offset
-				, double[] rhs, int rhs_offset, int op_len ) {
-		    System.arraycopy( rhs, rhs_offset, lhs, lhs_offset, op_len );
-		}
-	    } );
+	if ( getDataLength( other ) == 1 ) {
+	    double val = other.data[getTotalOffset(other, 0)];
+	    set( val );
+	}
+	else {
+	    binaryOperation( other, new IStridedBinaryOp() {
+		    public void op( double[] lhs, int lhs_offset
+				    , double[] rhs, int rhs_offset, int op_len ) {
+			System.arraycopy( rhs, rhs_offset, lhs, lhs_offset, op_len );
+		    }
+		} );
+	}
     }
 
     //Create new *dense* strided buffer with same data as this one.
@@ -574,4 +620,22 @@ public final class StridedBuffer
 	//But if it does I do want to know about it.
 	return null;
     }
+
+    public static boolean areOverlapping( StridedBuffer lhs, StridedBuffer rhs )
+	throws Exception
+    {
+	if ( lhs.data == rhs.data
+	     && getDataLength( lhs ) > 0
+	     && getDataLength( rhs ) > 0 ) {
+	    int lhs_start = getTotalOffset( lhs, 0 );
+	    int rhs_start = getTotalOffset( rhs, 0 );
+	    int lhs_end = getTotalOffset( lhs, ( getDataLength( lhs ) - 1 ) );
+	    int rhs_end = getTotalOffset( rhs, ( getDataLength( rhs ) - 1 ) );
+	    if ( ( lhs_start >= rhs_start && lhs_start <= rhs_end )
+		 || ( rhs_start >= lhs_start && rhs_start <= lhs_end ) )
+		return true;
+	}
+	return false;
+    }
+
 }

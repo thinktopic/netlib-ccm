@@ -3,13 +3,11 @@
             [clojure.core.matrix.protocols :as mp]
             [clojure.core.matrix.impl.mathsops :as mathsops]
             [clojure.core.matrix.implementations :as mi]
-            [netlib-ccm.strided-view :refer :all]
             [clojure.pprint])
   (:import [com.github.fommil.netlib BLAS]
            [netlib_ccm Ops IUnaryOp IBinaryOp
             StridedBuffer IStridedUnaryOp IStridedBinaryOp
-            IStridedTernaryOp]
-           [netlib_ccm.strided_view StridedView]))
+            IStridedTernaryOp]))
 
 
 (set! *warn-on-reflection* true)
@@ -18,7 +16,7 @@
 (definterface NetlibItem)
 
 (definterface AbstractView
-  (^netlib_ccm.strided_view.StridedView getStridedView []))
+  (^netlib_ccm.StridedBuffer getStridedBuffer []))
 
 (definterface AbstractVector
   (^double get [^long idx])
@@ -81,19 +79,28 @@
     (clojure.string/trim (with-out-str (clojure.pprint/pprint (mat-to-persistent-vec amat))))
     (format "<matrix of %dx%d>" (.rowCount amat) (.columnCount amat))))
 
+(defn validate-strided-buffer-shape [^StridedBuffer data]
+  (let [data-len (count (.data data))
+        item-end (+ (.offset data)
+                    (* (- (.row-count data) 1) (.row-stride data))
+                    (.column-count data))]
+    (when (> item-end data-len)
+      (throw (Exception. "Invalid strided view")))))
+
+
 (deftype DenseVector [^doubles data ^long offset ^long length]
   netlib_ccm.core.NetlibItem
   netlib_ccm.core.AbstractView
-  (^StridedView getStridedView [this] (new-strided-view data offset 1 length length))
+  (^StridedBuffer getStridedBuffer [this] (StridedBuffer. data offset length))
 
   netlib_ccm.core.AbstractVector
   (^double get [this ^long idx] (aget data (+ offset idx)))
   (set [this ^long idx ^double val] (aset data (+ offset idx) val))
   (^long length [this] length)
   (^netlib_ccm.core.AbstractVector clone [this]
-   (let [^StridedView retval (clone-strided-view (.getStridedView this))]
+   (let [^StridedBuffer retval (.clone (.getStridedBuffer this))]
      (->DenseVector (.data retval) 0 length)))
-  (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
+  (validateShape [this] (validate-strided-buffer-shape (.getStridedBuffer this)))
 
   clojure.lang.Seqable
   (seq [this] (map #(.get this %) (range length)))
@@ -108,10 +115,9 @@
 (deftype DenseMatrix [^DenseVector data ^long row-count ^long column-count]
   netlib_ccm.core.NetlibItem
   netlib_ccm.core.AbstractView
-  (^StridedView getStridedView [this]
+  (^StridedBuffer getStridedBuffer [this]
    (let [item-count (* row-count column-count)]
-     (new-strided-view (.data data) (.offset data)
-                    1 item-count item-count)))
+     (StridedBuffer. (.data data) (.offset data) item-count)))
   netlib_ccm.core.AbstractMatrix
   (^double get [this ^long row ^long column]
    (aget ^doubles (.data data)
@@ -132,15 +138,15 @@
   (setRow [this ^long row ^netlib_ccm.core.AbstractVector data]
     (let [^AbstractView strided-data data
           ^AbstractView row-data (.getRow this row)]
-      (assign-strided-view! (.getStridedView row-data)
-                            (.getStridedView strided-data))))
+      (.assign (.getStridedBuffer row-data)
+                            (.getStridedBuffer strided-data))))
   (^long rowCount [this] row-count)
   (^long columnCount [this] column-count)
   (^netlib_ccm.core.AbstractMatrix clone [this]
-   (let [retval (clone-strided-view (.getStridedView this))
+   (let [retval (.clone (.getStridedBuffer this))
          ary (->DenseVector (.data retval) 0 (* row-count column-count))]
      (->DenseMatrix ary row-count column-count)))
-  (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
+  (validateShape [this] (validate-strided-buffer-shape (.getStridedBuffer this)))
   clojure.lang.Seqable
   (seq [this] (map #(.getRow this %) (range (.rowCount this))))
 
@@ -154,39 +160,39 @@
 
 ;;A strided view of data where you can have N contiguous elements separated in rows of length Y.
 ;;Think of a small submatrix in a larger one
-(deftype StridedMatrix [^StridedView data ^long row-count ^long column-count]
+(deftype StridedMatrix [^StridedBuffer data ^long row-count ^long column-count]
   netlib_ccm.core.NetlibItem
   netlib_ccm.core.AbstractView
-  (^StridedView getStridedView [this] data)
+  (^StridedBuffer getStridedBuffer [this] data)
 
   netlib_ccm.core.AbstractMatrix
   (^double get [this ^long row ^long column]
    (aget ^doubles (.data data)
-         (get-strided-view-total-offset data (+ (* column-count row) column))))
+         (StridedBuffer/getTotalOffset data (+ (* column-count row) column))))
 
   (set [this ^long row ^long column ^double val]
     (aset ^doubles (.data data)
-          (get-strided-view-total-offset data (+ (* column-count row) column))
+          (StridedBuffer/getTotalOffset data (+ (* column-count row) column))
           val))
 
   (^netlib_ccm.core.AbstractVector getRow [this ^long row]
-   (let [sub-view (create-sub-strided-view data (* column-count row) column-count)]
+   (let [sub-view (.createSubStridedBuffer data (* column-count row) column-count)]
      (strided-view-to-vector sub-view)))
 
   (setRow [this ^long row ^netlib_ccm.core.AbstractVector data]
     (let [^AbstractView strided-data data
           ^AbstractView row-data (.getRow this row)]
-      (assign-strided-view! (.getStridedView row-data)
-                            (.getStridedView strided-data))))
+      (.assign (.getStridedBuffer row-data)
+                            (.getStridedBuffer strided-data))))
 
   (^long rowCount [this] row-count)
   (^long columnCount [this] column-count)
   (^netlib_ccm.core.AbstractMatrix clone [this]
-   (let [retval (clone-strided-view (.getStridedView this))
+   (let [retval (.clone (.getStridedBuffer this))
          item-count (* row-count column-count)
          ary (->DenseVector (.data retval) 0 item-count)]
      (->DenseMatrix ary row-count column-count)))
-  (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
+  (validateShape [this] (validate-strided-buffer-shape (.getStridedBuffer this)))
 
   clojure.lang.Seqable
   (seq [this] (map #(.getRow this %) (range (.rowCount this))))
@@ -199,24 +205,24 @@
   )
 
 ;;Interpret a submatrix as an array
-(deftype StridedVector [^StridedView data]
+(deftype StridedVector [^StridedBuffer data]
   netlib_ccm.core.NetlibItem
   netlib_ccm.core.AbstractView
-  (^StridedView getStridedView [this] data)
+  (^StridedBuffer getStridedBuffer [this] data)
 
   netlib_ccm.core.AbstractVector
   (^double get [this ^long idx]
-   (aget ^doubles (.data data) (get-strided-view-total-offset data idx)))
+   (aget ^doubles (.data data) (StridedBuffer/getTotalOffset data idx)))
 
   (set [this ^long idx ^double val]
-    (aset ^doubles (.data data) (get-strided-view-total-offset data idx) val))
+    (aset ^doubles (.data data) (StridedBuffer/getTotalOffset data idx) val))
 
-  (^long length [this] (get-strided-view-data-length data))
+  (^long length [this] (StridedBuffer/getDataLength data))
 
   (^netlib_ccm.core.AbstractVector clone [this]
-   (strided-view-to-vector (clone-strided-view (.getStridedView this))))
+   (strided-view-to-vector (.clone (.getStridedBuffer this))))
 
-  (validateShape [this] (validate-strided-view-shape (.getStridedView this)))
+  (validateShape [this] (validate-strided-buffer-shape (.getStridedBuffer this)))
 
   clojure.lang.Seqable
   (seq [this] (map #(.get this %) (range (.length this))))
@@ -228,16 +234,16 @@
   (iterator [this] (matrix-iterator this)))
 
 (defn strided-view-to-vector
-  ^AbstractVector [^StridedView view]
-  (if (is-strided-view-dense? view)
-    (->DenseVector (.data view) (get-strided-view-total-offset view 0)
-                   (get-strided-view-data-length view))
+  ^AbstractVector [^StridedBuffer view]
+  (if (StridedBuffer/isDense view)
+    (->DenseVector (.data view) (StridedBuffer/getTotalOffset view 0)
+                   (StridedBuffer/getDataLength view))
     (->StridedVector view)))
 
 (defn strided-view-to-matrix
   "A strided view can be a matrix when it addresses a block of memory
 with the same number of columns in each row"
-  ^AbstractMatrix [^StridedView view ^long num-rows ^long num-cols]
+  ^AbstractMatrix [^StridedBuffer view ^long num-rows ^long num-cols]
   (when-not (and (= (.column-count view) (.initial-column-count view))
                  (or (= 0 (.last-column-count view))
                      (= (.column-count view) (.last-column-count view))))
@@ -253,8 +259,8 @@ with the same number of columns in each row"
 (defn get-submatrix
   [^AbstractMatrix m start-row num-rows start-col num-cols]
   (let [^AbstractView mat-view m
-        ^StridedView view (.getStridedView mat-view)
-        num-data-items (get-strided-view-data-length view)]
+        ^StridedBuffer view (.getStridedBuffer mat-view)
+        num-data-items (StridedBuffer/getDataLength view)]
     (when-not (and (= (.column-count view) (.initial-column-count view))
                    (= 0 (rem num-data-items (.columnCount m))))
       (throw (Exception. "Submatric views on offset matrixes are not supported")))
@@ -271,8 +277,8 @@ with the same number of columns in each row"
         (let [row-stride (if (= 1 (.row-count view))
                            (.columnCount m)
                            (.row-stride view))
-              new-view (new-strided-view (.data view)
-                                         (get-strided-view-total-offset view data-start-offset)
+              new-view (StridedBuffer. (.data view)
+                                         (StridedBuffer/getTotalOffset view data-start-offset)
                                          ;;Add one row to account for the 0 last-column-count
                                          (+ num-rows 1)
                                          num-cols
@@ -290,19 +296,19 @@ with the same number of columns in each row"
 (defn set-column
   [^AbstractMatrix mat ^long column ^AbstractVector data]
   (let [^AbstractView col-view (get-column mat column)
-        ^StridedView column (.getStridedView col-view)
-        ^StridedView data-view (.getStridedView ^AbstractView data)]
-    (assign-strided-view! column data-view)))
+        ^StridedBuffer column (.getStridedBuffer col-view)
+        ^StridedBuffer data-view (.getStridedBuffer ^AbstractView data)]
+    (.assign column data-view)))
 
 
 (defn new-dense-vector-from-strided-view
-  ^DenseVector [^StridedView view]
-  (let [new-view (clone-strided-view view)]
+  ^DenseVector [^StridedBuffer view]
+  (let [new-view (.clone view)]
     (->DenseVector (.data new-view) 0 (* (.row-count new-view) (.column-count new-view)))))
 
 
 (defn new-dense-matrix-from-strided-view
-  ^DenseMatrix [^StridedView view row-count column-count]
+  ^DenseMatrix [^StridedBuffer view row-count column-count]
   (let [^DenseVector new-vec (new-dense-vector-from-strided-view view)
         ^DenseMatrix retval (->DenseMatrix new-vec row-count column-count)]
     (.validateShape retval)
@@ -360,11 +366,11 @@ with the same number of columns in each row"
 
 (defn view-as-dense-matrix
   ^DenseMatrix [^AbstractView v ^long num-rows ^long num-columns]
-  (let [^StridedView view (.getStridedView v)]
-    (when-not (is-strided-view-dense? view)
+  (let [^StridedBuffer view (.getStridedBuffer v)]
+    (when-not (StridedBuffer/isDense view)
       (throw (Exception. "Unsupported for non dense views")))
     (let [item-count (* num-rows num-columns)
-          data-len (get-strided-view-data-length view)]
+          data-len (StridedBuffer/getDataLength view)]
       (when-not (= item-count data-len)
         (throw (Exception. (format "Unsupported as item-count data-len mismatch %d vs %d"
                                    item-count data-len))))
@@ -496,11 +502,11 @@ with the same number of columns in each row"
 (extend-protocol mp/PValidateShape
   AbstractVector
   (validate-shape [m] (let [^AbstractView v m]
-                        (validate-strided-view-shape (.getStridedView v))
+                        (validate-strided-buffer-shape (.getStridedBuffer v))
                         [(.length m)]))
   AbstractMatrix
   (validate-shape [m] (let [^AbstractView v m]
-                        (validate-strided-view-shape (.getStridedView v))
+                        (validate-strided-buffer-shape (.getStridedBuffer v))
                         [(.rowCount m) (.columnCount m)])))
 
 
@@ -529,8 +535,8 @@ with the same number of columns in each row"
 (extend-protocol mp/PDense
   AbstractView
   (dense [m]
-    (let [^StridedView new-data (clone-strided-view (.getStridedView ^AbstractView m))
-          dense-vec (->DenseVector (.data new-data) 0 (get-strided-view-data-length new-data))]
+    (let [^StridedBuffer new-data (.clone (.getStridedBuffer ^AbstractView m))
+          dense-vec (->DenseVector (.data new-data) 0 (StridedBuffer/getDataLength new-data))]
       (if (instance? AbstractVector m)
         dense-vec
         (let [^AbstractMatrix m m]
@@ -549,7 +555,7 @@ with the same number of columns in each row"
 (extend-protocol mp/PReshaping
   AbstractView
   (reshape [m shape] (let [^DenseVector m (new-dense-vector-from-strided-view
-                                           (.getStridedView ^AbstractView m))
+                                           (.getStridedBuffer ^AbstractView m))
                            num-desired (long (apply * shape))
                            data-len (.length m)
                            m (->DenseVector (.data m) 0 num-desired)]
@@ -599,8 +605,8 @@ with the same number of columns in each row"
   AbstractView
   (subvector [m start length]
     (let [^AbstractView view m
-          ^StridedView data (.getStridedView view)]
-      (strided-view-to-vector (create-sub-strided-view data start length)))))
+          ^StridedBuffer data (.getStridedBuffer view)]
+      (strided-view-to-vector (.createSubStridedBuffer data start length)))))
 
 
 (extend-protocol mp/PSubMatrix
@@ -622,8 +628,8 @@ with the same number of columns in each row"
   (assign-source-to-view! [source m]
     (let [^doubles source source
           ^AbstractView m m]
-      (assign-strided-view! (.getStridedView m)
-                            (new-strided-view source 0 (count source)))
+      (.assign (.getStridedBuffer m)
+                            (StridedBuffer. source 0 (count source)))
       m))
 
   AbstractView
@@ -631,7 +637,7 @@ with the same number of columns in each row"
     (let [^AbstractView source source
           ^AbstractView m m]
       (when-not (identical? source m)
-        (assign-strided-view! (.getStridedView m) (.getStridedView source)))
+        (.assign (.getStridedBuffer m) (.getStridedBuffer source)))
       m))
 
   clojure.lang.PersistentVector
@@ -654,7 +660,7 @@ with the same number of columns in each row"
           ^AbstractView m m]
       (if (= 0.0 source)
         (mp/scale! m 0.0)
-        (strided-op (.getStridedView m)
+        (StridedBuffer/unaryOperation (.getStridedBuffer m)
                     (fn [^doubles data ^long offset ^long len]
                       (java.util.Arrays/fill data offset (+ offset len) source))))
       m)))
@@ -666,8 +672,8 @@ with the same number of columns in each row"
   (assign-array! [m arr] (mp/assign-array! m arr 0 (count arr)))
   (assign-array! [m arr offset len]
     (let [^AbstractView m m]
-      (assign-strided-view! (.getStridedView m)
-                            (new-strided-view arr offset len)))))
+      (.assign (.getStridedBuffer m)
+               (StridedBuffer. arr offset len)))))
 
 
 (extend-protocol mp/PMutableFill
@@ -679,14 +685,14 @@ with the same number of columns in each row"
   AbstractView
   (to-double-array [m]
     (let [^AbstractView m m
-          ^StridedView view (.getStridedView m)]
-      (if (is-strided-view-complete-dense? view)
+          ^StridedBuffer view (.getStridedBuffer m)]
+      (if (StridedBuffer/isCompleteDense view)
         (.data view)
-        (.data (clone-strided-view view)))))
+        (.data (.clone view)))))
   (as-double-array [m]
     (let [^AbstractView m m
-          ^StridedView view (.getStridedView m)]
-      (when (is-strided-view-complete-dense? view)
+          ^StridedBuffer view (.getStridedBuffer m)]
+      (when (StridedBuffer/isCompleteDense view)
         (.data view)))))
 
 
@@ -694,7 +700,7 @@ with the same number of columns in each row"
   AbstractView
   (as-vector [m]
     (let [^AbstractView m m]
-      (strided-view-to-vector (.getStridedView m)))))
+      (strided-view-to-vector (.getStridedBuffer m)))))
 
 (defn clone-abstract-view
   [^AbstractView view]
@@ -713,12 +719,11 @@ with the same number of columns in each row"
 
 (defmacro unary-op-macro!
   [view & body]
-  `(let [^"StridedView" view# (.getStridedView ^AbstractView ~view)
+  `(let [^"StridedBuffer" view# (.getStridedBuffer ^AbstractView ~view)
          ^"IUnaryOp" local-op# (reify netlib_ccm.IUnaryOp
                                  (op[this# ~'lhs-value]
                                    ~@body))]
-     (strided-op view# (fn [data# offset# len#]
-                         (Ops/OpY len# data# offset# local-op#)))))
+     (StridedBuffer/unaryOperationOp view# local-op#)))
 
 (defn unary-op!
   [^AbstractView view op]
@@ -735,10 +740,13 @@ with the same number of columns in each row"
 
 (defn binary-op!
   "lhs gets (op lhs rhs)"
-  [^AbstractView lhs ^AbstractView rhs op]
-  (let [^StridedView rhs-view (.getStridedView rhs)
-        ^StridedView lhs-view (.getStridedView lhs)]
-    (strided-view-binary-java-op! lhs-view rhs-view (op lhs-value rhs-value))))
+  [^AbstractView lhs ^AbstractView rhs bin-op]
+  (let [^StridedBuffer rhs-view (.getStridedBuffer rhs)
+        ^StridedBuffer lhs-view (.getStridedBuffer lhs)]
+    (StridedBuffer/binaryOperationOp lhs-view rhs-view
+                                      (reify IBinaryOp
+                                                   (op [this lhs-val rhs-val]
+                                                     (bin-op lhs-val rhs-val))))))
 
 
 (defn binary-immutable-op
@@ -773,21 +781,21 @@ with the same number of columns in each row"
 
 (extend-protocol mp/PFunctionalOperations
   AbstractView
-  (element-seq [m] (let [view (.getStridedView ^AbstractView m)]
+  (element-seq [m] (let [view (.getStridedBuffer ^AbstractView m)]
                      (map #(aget ^doubles
                                  (.data view)
-                                 (get-strided-view-total-offset view %))
-                          (range (get-strided-view-data-length view)))))
+                                 (StridedBuffer/getTotalOffset view %))
+                          (range (StridedBuffer/getDataLength view)))))
 
   (element-map!
     ([m f] (do (unary-op! m f) m))
     ([m f a] (do (source-view-op! (to-netlib a) m f) m))
-    ([m f a more] (let [^StridedView view (.getStridedView ^AbstractView m)
-                        num-items (get-strided-view-data-length view)
+    ([m f a more] (let [^StridedBuffer view (.getStridedBuffer ^AbstractView m)
+                        num-items (StridedBuffer/getDataLength view)
                         rest-list (mapv to-netlib (concat a more))]
                     (loop [idx 0]
                       (when (< idx num-items)
-                        (let [m-offset (get-strided-view-total-offset view idx)
+                        (let [m-offset (StridedBuffer/getTotalOffset view idx)
                               double-val (double (apply f (aget ^doubles (.data view) m-offset)
                                                         (map #(mp/get-1d % idx) rest-list)))]
                           (aset ^doubles (.data view) m-offset double-val))
@@ -810,26 +818,19 @@ with the same number of columns in each row"
 
 (defn dot-abstract-views
   ^double [^AbstractView lhs ^AbstractView rhs]
-  (let [^StridedView lhs-view (.getStridedView lhs)
-        ^StridedView rhs-view (.getStridedView rhs)]
-    (if (and (is-strided-view-dense? lhs-view)
-             (is-strided-view-dense? rhs-view))
-      (let [op-len (min (get-strided-view-data-length lhs-view)
-                        (get-strided-view-data-length rhs-view))]
-        (if (> op-len 0)
-          (.ddot (BLAS/getInstance) op-len
-                 (.data lhs-view) (get-strided-view-total-offset lhs-view 0) 1
-                 (.data rhs-view) (get-strided-view-total-offset rhs-view 0) 1)
-          0.0))
-      (let [^doubles accum (make-array Double/TYPE 1)]
-        (strided-op (.getStridedView lhs) (.getStridedView rhs)
-                    (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
-                      (let [accum-val (aget accum 0)
-                            dot-val (.ddot (BLAS/getInstance) op-len
-                                           ^doubles lhs-data lhs-offset
-                                           ^doubles rhs-data rhs-offset)]
-                        (aset accum 0 (+ dot-val accum-val)))))
-        (aget accum 0)))))
+  (let [^StridedBuffer lhs-view (.getStridedBuffer lhs)
+        ^StridedBuffer rhs-view (.getStridedBuffer rhs)
+        ^doubles accum (make-array Double/TYPE 1)]
+    (StridedBuffer/binaryOperation
+     lhs-view rhs-view
+     (reify IStridedBinaryOp
+       (op [this lhs-data lhs-offset rhs-data rhs-offset op-len]
+         (let [accum-val (aget accum 0)
+               dot-val (.ddot (BLAS/getInstance) op-len
+                              ^doubles lhs-data lhs-offset
+                              ^doubles rhs-data rhs-offset)]
+           (aset accum 0 (+ dot-val accum-val))))))
+    (aget accum 0)))
 
 
 (defprotocol AbstractViewVectorOps
@@ -870,24 +871,18 @@ with the same number of columns in each row"
   (let [^AbstractView x (to-netlib x)
         alpha (double alpha)
         ^AbstractView y y
-        ^StridedView x-view (.getStridedView x)
-        ^StridedView y-view (.getStridedView y)
-        x-len (get-strided-view-data-length x-view)
-        y-len (get-strided-view-data-length y-view)]
+        ^StridedBuffer x-view (.getStridedBuffer x)
+        ^StridedBuffer y-view (.getStridedBuffer y)
+        x-len (StridedBuffer/getDataLength x-view)
+        y-len (StridedBuffer/getDataLength y-view)]
     (when-not (= 0 (rem y-len x-len))
       (throw (Exception. "y-len must be even multiple of x-len")))
     (if (= 1 x-len)
       (let [x-val (aget ^doubles (.data x-view)
-                        (get-strided-view-total-offset x-view 0))]
+                        (StridedBuffer/getTotalOffset x-view 0))]
         (mp/matrix-add! y (* alpha x-val)))
-      (let [num-ops (quot y-len x-len)
-            op-len x-len
-            axpy-op (fn [y-data y-offset x-data x-offset op-len]
-                      (let [^doubles y-data y-data
-                            ^long y-offset y-offset
-                            ^doubles x-data x-data
-                            ^long x-offset x-offset
-                            ^long op-len op-len]
+      (let [axpy-op (reify IStridedBinaryOp
+                      (op [this y-data y-offset x-data x-offset op-len]
                         ;;Found through some perf testing.  Probably different ratios
                         ;;on other architectures.
                         (if (< op-len 150)
@@ -895,15 +890,9 @@ with the same number of columns in each row"
                                     x-data x-offset
                                     y-data y-offset)
                           (.daxpy (BLAS/getInstance) op-len alpha
-                                  ^doubles x-data ^long x-offset 1
-                                  ^doubles y-data ^long y-offset 1))))]
-        (if (= 1 num-ops)
-          (strided-op y-view x-view axpy-op)
-          (loop [op-idx 0]
-           (when (< op-idx num-ops)
-             (let [new-y-view (create-sub-strided-view y-view (* op-idx op-len) op-len)]
-               (strided-op new-y-view x-view axpy-op))
-             (recur (inc op-idx))))))))
+                                  x-data x-offset 1
+                                  y-data y-offset 1))))]
+        (StridedBuffer/binaryOperation y-view x-view axpy-op))))
   y)
 
 
@@ -923,8 +912,9 @@ with the same number of columns in each row"
 
 (defn make-ones-data
   [new-len]
-  (let [^DenseVector new-data (new-dense-vector new-len)]
-    (java.util.Arrays/fill ^doubles (.data new-data) 1.0)
+  (let [^DenseVector new-data (new-dense-vector new-len)
+        ^StridedBuffer data-buf (.getStridedBuffer new-data)]
+    (.set data-buf 1.0)
     new-data))
 
 (defonce ones-data (atom (make-ones-data 1000)))
@@ -934,7 +924,7 @@ with the same number of columns in each row"
   [m]
   (let [ones-len (if (ma/scalar? m)
                    (long m)
-                   (get-strided-view-data-length (.getStridedView ^AbstractView m)))]
+                   (StridedBuffer/getDataLength (.getStridedBuffer ^AbstractView m)))]
     (loop [^DenseVector current-ones @ones-data]
       (let [current-len (.length current-ones)]
         (if (> ones-len current-len)
@@ -971,16 +961,16 @@ with the same number of columns in each row"
 (extend-protocol mp/PMatrixMutableScaling
   AbstractView
   (scale! [m constant]
-    (let [^StridedView m-view (.getStridedView ^AbstractView m)
+    (let [^StridedBuffer m-view (.getStridedBuffer ^AbstractView m)
           constant (double constant)]
-      (if (is-strided-view-dense? m-view)
-        (let [op-len (get-strided-view-data-length m-view)]
+      (if (StridedBuffer/isDense m-view)
+        (let [op-len (StridedBuffer/getDataLength m-view)]
           (when (> op-len 0)
             (.dscal (BLAS/getInstance) op-len constant
-                    (.data m-view) (get-strided-view-total-offset m-view 0) 1)))
-        (strided-op m-view (fn [^doubles data ^long offset ^long len]
-                             (.dscal (BLAS/getInstance) len constant
-                                     data offset 1)))))
+                    (.data m-view) (StridedBuffer/getTotalOffset m-view 0) 1)))
+        (StridedBuffer/unaryOperation m-view (fn [^doubles data ^long offset ^long len]
+                                               (.dscal (BLAS/getInstance) len constant
+                                                       data offset 1)))))
     m)
   (pre-scale [m constant] (mp/scale! m constant)))
 
@@ -995,22 +985,22 @@ with the same number of columns in each row"
   ^DenseVector [^AbstractView m]
   (if (instance? DenseVector m)
     m
-    (let [^StridedView data-view (.getStridedView ^AbstractView m)]
-      (if (is-strided-view-dense? data-view)
-        (->DenseVector (.data data-view) (get-strided-view-total-offset data-view 0)
-                       (get-strided-view-data-length data-view))
-        (let [new-view (clone-strided-view data-view)]
-          (->DenseVector (.data new-view) 0 (get-strided-view-data-length new-view)))))))
+    (let [^StridedBuffer data-view (.getStridedBuffer ^AbstractView m)]
+      (if (StridedBuffer/isDense data-view)
+        (->DenseVector (.data data-view) (StridedBuffer/getTotalOffset data-view 0)
+                       (StridedBuffer/getDataLength data-view))
+        (let [new-view (.clone data-view)]
+          (->DenseVector (.data new-view) 0 (StridedBuffer/getDataLength new-view)))))))
 
 
 (defn make-dense-matrix
   (^DenseMatrix [^AbstractMatrix m]
    (if (instance? DenseMatrix m)
      m
-     (let [^StridedView data-view (.getStridedView ^AbstractView m)]
-       (if (is-strided-view-dense? data-view)
-         (->DenseMatrix (->DenseVector (.data data-view) (get-strided-view-total-offset data-view 0)
-                                       (get-strided-view-data-length data-view))
+     (let [^StridedBuffer data-view (.getStridedBuffer ^AbstractView m)]
+       (if (StridedBuffer/isDense data-view)
+         (->DenseMatrix (->DenseVector (.data data-view) (StridedBuffer/getTotalOffset data-view 0)
+                                       (StridedBuffer/getDataLength data-view))
                         (.rowCount m)
                         (.columnCount m))
          ;;probably less expensive than operating on non-dense data
@@ -1038,7 +1028,7 @@ with the same number of columns in each row"
 
 (defn are-abstract-views-overlapping?
   [^AbstractView lhs ^AbstractView rhs]
-  (are-strided-views-overlapping? (.getStridedView lhs) (.getStridedView rhs)))
+  (StridedBuffer/areOverlapping (.getStridedBuffer lhs) (.getStridedBuffer rhs)))
 
 
 (defn blas-gemm!
@@ -1245,10 +1235,10 @@ with the same number of columns in each row"
   (let [^DenseVector a (make-dense-vector a)
         ^DenseVector x (make-dense-vector x)
         ^AbstractView y y
-        overlapping? (or (are-strided-views-overlapping? (.getStridedView a)
-                                                         (.getStridedView y))
-                         (are-strided-views-overlapping? (.getStridedView x)
-                                                         (.getStridedView y)))
+        overlapping? (or (StridedBuffer/areOverlapping (.getStridedBuffer a)
+                                                         (.getStridedBuffer y))
+                         (StridedBuffer/areOverlapping (.getStridedBuffer x)
+                                                         (.getStridedBuffer y)))
         dest (if overlapping?
                (clone-abstract-view y)
                y)
@@ -1285,60 +1275,50 @@ with the same number of columns in each row"
 
 (defn non-blas-element-multiply!
   [alpha a x beta y]
-  (let [^StridedView a-view (.getStridedView ^AbstractView (to-netlib a))
-        ^StridedView x-view (.getStridedView ^AbstractView (to-netlib x))
-        ^StridedView y-view (.getStridedView ^AbstractView y)
+  (let [^StridedBuffer a-view (.getStridedBuffer ^AbstractView (to-netlib a))
+        ^StridedBuffer x-view (.getStridedBuffer ^AbstractView (to-netlib x))
+        ^StridedBuffer y-view (.getStridedBuffer ^AbstractView y)
         alpha (double alpha)
-        beta (double beta)]
-    (if (= 0.0 beta)
-      (do
-        ;;Assign to the overlapping views.  This takes care of identity
-        ;;And non pathological cases.
-        (if (are-strided-views-overlapping? y-view a-view)
-          (assign-strided-view! y-view a-view)
-          (assign-strided-view! y-view x-view))
+        beta (double beta)
+        a-len (StridedBuffer/getDataLength a-view)
+        x-len (StridedBuffer/getDataLength x-view)]
+    (if (or (= 1 a-len)
+            (= 1 x-len))
+      (let [reduce-val (double
+                        (if (= 1 a-len)
+                          (aget (.data a-view) (StridedBuffer/getTotalOffset a-view 0))
+                          (aget (.data x-view) (StridedBuffer/getTotalOffset x-view 0))))
+            alpha (* alpha reduce-val)
+            new-x (if (= 1 a-len)
+                    x
+                    a)]
+        (blas-axpy! alpha new-x beta y))
+      ;;Else we may need to actually consider all three objects
+      (if (= 0.0 beta)
+        (do
+          ;;Assign to the overlapping views.  This takes care of identity
+          ;;And non pathological cases.
+          (if (StridedBuffer/areOverlapping y-view a-view)
+            (.assign y-view a-view)
+            (.assign y-view x-view))
 
-        (let [src-view (if (are-strided-views-overlapping? y-view a-view)
-                         x-view
-                         a-view)
-              dest-len (get-strided-view-data-length y-view)
-              src-len (get-strided-view-data-length src-view)
-              num-ops (quot dest-len src-len)
-              op-len src-len]
-          (loop [idx 0]
-            (when (< idx num-ops)
-              (strided-op (create-sub-strided-view y-view (* idx op-len) op-len)
-                          src-view
-                          (fn [y-data y-offset x-data x-offset op-len]
-                            (let [^doubles y-data y-data
-                                  ^long y-offset y-offset
-                                  ^doubles x-data x-data
-                                  ^long x-offset x-offset
-                                  ^long op-len op-len]
-                              (Ops/alphaAY op-len alpha x-data x-offset y-data y-offset))))
-              (recur (inc idx))))))
-      (do
-        (if (and (is-strided-view-dense? a-view)
-                 (is-strided-view-dense? x-view)
-                 (is-strided-view-dense? y-view))
-          (let [data-len (get-strided-view-data-length y-view)
-                a-offset (get-strided-view-total-offset a-view 0)
-                a-len (get-strided-view-data-length a-view)
-                x-offset (get-strided-view-total-offset x-view 0)
-                x-len (get-strided-view-data-length x-view)
-                y-offset (get-strided-view-total-offset y-view 0)
-                ^doubles a-data (.data a-view)
-                ^doubles x-data (.data x-view)
-                ^doubles y-data (.data y-view)]
-            (Ops/alphaAXPlusBetaY data-len alpha
-                                  a-data a-offset
-                                  x-data x-offset
-                                  beta
-                                  y-data
-                                  y-offset))
-          (let [temp-item (clone-abstract-view y)]
-            (non-blas-element-multiply! alpha a x 0.0 temp-item)
-            (blas-axpy! beta temp-item y)))))
+          (let [src-view (if (StridedBuffer/areOverlapping y-view a-view)
+                           x-view
+                           a-view)]
+            (StridedBuffer/binaryOperation
+             y-view src-view
+             (reify IStridedBinaryOp
+               (op [this y-data y-offset x-data x-offset op-len]
+                 (Ops/alphaAY op-len alpha x-data x-offset y-data y-offset))))))
+        (StridedBuffer/ternaryOperation
+         y-view a-view x-view
+         (reify IStridedTernaryOp
+           (op [this lhs-data lhs-offset mid-data mid-offset rhs-data rhs-offset op-len]
+             (Ops/alphaAXPlusBetaY op-len alpha
+                                   rhs-data rhs-offset
+                                   mid-data mid-offset
+                                   beta
+                                   lhs-data lhs-offset))))))
     y))
 
 
@@ -1372,10 +1352,10 @@ with the same number of columns in each row"
 
 (defn clone-larger-view
   [a b]
-  (let [view-a (.getStridedView ^AbstractView a)
-        view-b (.getStridedView ^AbstractView b)]
-    (if (> (get-strided-view-data-length view-a)
-           (get-strided-view-data-length view-b))
+  (let [view-a (.getStridedBuffer ^AbstractView a)
+        view-b (.getStridedBuffer ^AbstractView b)]
+    (if (> (StridedBuffer/getDataLength view-a)
+           (StridedBuffer/getDataLength view-b))
       (clone-abstract-view a)
       (clone-abstract-view b))))
 
@@ -1413,10 +1393,13 @@ with the same number of columns in each row"
     ([m] (mp/element-map! m /))
     ([m a] (if (ma/scalar? a)
              (ma/scale! m (/ 1.0 (double a)))
-             (let [m-view (.getStridedView ^AbstractView m)
-                   a-view (.getStridedView ^AbstractView a)]
-               (strided-view-binary-java-op! m-view a-view
-                                             (/ lhs-value rhs-value)))))))
+             (let [m-view (.getStridedBuffer ^AbstractView m)
+                   a-view (.getStridedBuffer ^AbstractView a)]
+               (StridedBuffer/binaryOperationOp
+                m-view a-view
+                (reify IBinaryOp
+                  (op [this lhs-val rhs-val]
+                    (/ lhs-val rhs-val)))))))))
 
 
 (extend-protocol mp/PMatrixDivide
@@ -1460,7 +1443,7 @@ with the same number of columns in each row"
 
 (extend-protocol mp/PElementCount
   AbstractView
-  (element-count [m] (get-strided-view-data-length (.getStridedView ^AbstractView m))))
+  (element-count [m] (StridedBuffer/getDataLength (.getStridedBuffer ^AbstractView m))))
 
 
 
