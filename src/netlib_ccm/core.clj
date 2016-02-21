@@ -913,16 +913,18 @@ with the same number of columns in each row"
     (.set data-buf 1.0)
     new-data))
 
-(defonce ones-data (atom (make-ones-data 1000)))
+(defonce ones-data (atom nil))
 
 (defn ones
   "Array of ones of length m.  Don't assign to this or you get what you get."
   [m]
-  (let [ones-len (if (ma/scalar? m)
-                   (long m)
-                   (StridedBuffer/getDataLength (.getStridedBuffer ^AbstractView m)))]
+  (let [ones-len (long (if (ma/scalar? m)
+                         (long m)
+                         (StridedBuffer/getDataLength (.getStridedBuffer ^AbstractView m))))]
     (loop [^DenseVector current-ones @ones-data]
-      (let [current-len (.length current-ones)]
+      (let [current-len (long (if current-ones
+                                (.length current-ones)
+                                0))]
         (if (> ones-len current-len)
           (let [new-len (* 2 ones-len)
                 new-data (make-ones-data new-len)]
@@ -1076,6 +1078,42 @@ with the same number of columns in each row"
    (blas-gemm! false false alpha a b beta c)))
 
 
+(defn blas-gemv!
+  [trans-a? alpha a b beta c]
+  (let [^DenseMatrix a (make-dense-matrix (to-netlib a) :row)
+        ^DenseVector b (make-dense-vector (to-netlib b))
+        alpha (double alpha)
+        beta (double beta)
+
+        a-dims (if trans-a?
+                 [(.columnCount a) (.rowCount a)]
+                 [(.rowCount a) (.columnCount a)])
+        M (first a-dims)
+        N (second a-dims)
+        _ (when-not (= N (.length b))
+            (throw (Exception. "GEMV mismatch")))
+
+        overlapping? (or (are-abstract-views-overlapping? a c)
+                         (are-abstract-views-overlapping? b c))
+
+        dest (if overlapping?
+               (clone-abstract-view c)
+               c)
+
+        ^DenseVector m (make-dense-vector c)
+        ;;The matrix is already transposed according to blas
+        ;;so we reverse this here
+        trans-command-a (if trans-a? "n" "t")
+        ^DenseVector a-data (.data a)]
+    (.dgemv (BLAS/getInstance) trans-command-a (.columnCount a) (.rowCount a) alpha
+            (.data a-data) (.offset a-data) (.columnCount a)
+            (.data b) (.offset b) 1
+            beta
+            (.data m) (.offset m) 1)
+    (assign-source-to-view! m c))
+  )
+
+
 (defmulti typed-blas-gemm! (fn [trans-a? trans-b? alpha a b beta c]
                              [(get-arg-mat-type a)
                               (get-arg-mat-type b)]))
@@ -1086,11 +1124,15 @@ with the same number of columns in each row"
 
 (defmethod typed-blas-gemm! [:matrix :vector]
   [trans-a? trans-b? alpha a b beta c]
-  (blas-gemm! trans-a? trans-b? alpha a b beta c))
+  (if (not trans-b?)
+    (blas-gemv! trans-a? alpha a b beta c)
+    (blas-gemm! trans-a? trans-b? alpha a b beta c)))
 
 (defmethod typed-blas-gemm! [:vector :matrix]
   [trans-a? trans-b? alpha a b beta c]
-  (blas-gemm! trans-a? trans-b? alpha a b beta c))
+  (if (not trans-a?)
+    (blas-gemv! (not trans-b?) alpha b a beta c)
+    (blas-gemm! trans-a? trans-b? alpha a b beta c)))
 
 
 (defmethod typed-blas-gemm! [:vector :vector]
@@ -1355,6 +1397,9 @@ with the same number of columns in each row"
       (clone-abstract-view a)
       (clone-abstract-view b))))
 
+(defonce mul-op (reify IStridedBinaryOp
+                  (op [this y-data y-offset x-data x-offset op-len]
+                    (Ops/AY op-len x-data x-offset y-data y-offset))))
 
 (extend-protocol mp/PMatrixMultiplyMutable
   AbstractView
@@ -1366,9 +1411,12 @@ with the same number of columns in each row"
   (element-multiply! [m a]
     (if (ma/scalar? a)
       (ma/scale! m a)
-      (assign-source-to-view! (typed-element-multiply! (to-netlib a) m m
-                                                       1.0 0.0)
-                              m))))
+      (do
+       (StridedBuffer/binaryOperation
+        (.getStridedBuffer ^AbstractView m)
+        (.getStridedBuffer ^AbstractView (to-netlib  a))
+        mul-op)))
+    m))
 
 (extend-protocol mp/PMatrixMultiply
   AbstractView
@@ -1391,11 +1439,11 @@ with the same number of columns in each row"
              (ma/scale! m (/ 1.0 (double a)))
              (let [m-view (.getStridedBuffer ^AbstractView m)
                    a-view (.getStridedBuffer ^AbstractView a)]
-               (StridedBuffer/binaryOperationOp
+               (StridedBuffer/binaryOperation
                 m-view a-view
-                (reify IBinaryOp
-                  (op [this rhs-val lhs-val]
-                    (/ lhs-val rhs-val)))))))))
+                (reify IStridedBinaryOp
+                  (op [this lhs-data lhs-offset rhs-data rhs-offset op-len]
+                    (Ops/DivXY op-len rhs-data rhs-offset lhs-data lhs-offset)))))))))
 
 
 (extend-protocol mp/PMatrixDivide
@@ -1413,7 +1461,7 @@ with the same number of columns in each row"
             a (if scalar-a? b a)
             b (if scalar-a? a b)]
         (mp/add-scaled! m a (* factor ^double b)))
-      (typed-element-multiply! (to-netlib a) (to-netlib b) m factor 1.0))))
+      (non-blas-element-multiply! factor (to-netlib a) (to-netlib b) 1.0 m))))
 
 
 (extend-protocol mp/PAddScaledProduct
@@ -1465,5 +1513,5 @@ with the same number of columns in each row"
 
 (maths-ops)
 
-(def empty-vec (new-dense-vector 0))
-7(mi/register-implementation empty-vec)
+(def empty-vec (reify NetlibItem))
+(mi/register-implementation empty-vec)

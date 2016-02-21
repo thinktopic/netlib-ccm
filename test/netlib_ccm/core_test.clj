@@ -9,7 +9,8 @@
   (:import [com.github.fommil.netlib BLAS]
            [netlib_ccm Ops StridedBuffer IUnaryOp IStridedUnaryOp
             IBinaryOp IStridedBinaryOp]
-           [netlib_ccm.strided_view StridedView]))
+           [netlib_ccm.strided_view StridedView])
+  (:gen-class))
 
 
 
@@ -108,6 +109,21 @@
     (inner-compare "c*m" c b)))
 
 
+(defn gemm-vs-gemv-perftest
+  []
+  (doseq [elem-count [10 20 100 1000]]
+    (let [iter-count 1000
+          mat-data (m/array :netlib (repeat elem-count (range elem-count)))
+          vec-data (m/array :netlib (range elem-count))
+          result-data (m/array :netlib (repeat elem-count 0))]
+      (print "gemm")
+      (time (dotimes [iter iter-count]
+              (nc/blas-gemm! false false 1.0 mat-data vec-data 1.0 result-data)))
+      (print "gemv")
+      (time (dotimes [iter iter-count]
+              (nc/blas-gemv! false 1.0 mat-data vec-data 1.0 result-data))))))
+
+
 (defn outer-product
   [impl size]
   (let [a (m/array impl (range 1 (+ size 1)))
@@ -192,26 +208,14 @@
 
 (defn perf-test-element-multiply
   []
-  (doseq [elem-count [10 100 1000 10000 100000]]
-    (println "elem-count" elem-count)
-    (let [^netlib_ccm.core.DenseVector y (m/array :netlib (repeat elem-count 1))
-          ^netlib_ccm.core.DenseVector x (m/array :netlib (repeat elem-count 2))
-          ^netlib_ccm.core.DenseVector a (m/array :netlib (repeat elem-count 3))]
-      (print "clojure:")
+  (doseq [elem-count [10 100 1000 10000 100000]
+          impl [:netlib :vectorz]]
+    (println "elem-count" elem-count "impl" impl)
+    (let [y (m/array impl (repeat elem-count 1))
+          x (m/array impl (repeat elem-count 2))
+          a (m/array impl (repeat elem-count 3))]
       (time (dotimes [iter 1000]
-              (nc/dense-element-multiply! 1.0
-                                          (.data a) 0
-                                          (.data x) 0
-                                          1.0
-                                          (.data y) 0
-                                          elem-count)))
-      (print "java   :")
-      (time (dotimes [iter 1000]
-              (Ops/alphaAXPlusBetaY elem-count 1.0
-                                    ^doubles (.data a) 0
-                                    ^doubles (.data x) 0
-                                    1.0
-                                    ^doubles (.data y) 0))))))
+              (m/add-scaled-product! y a x 2.0))))))
 
 
 (defn perf-test-axpy
@@ -258,36 +262,67 @@
               (m/sqrt! a)))
       )))
 
-
-(defn perf-test-binary-op!
+(defn perf-test-div!
   []
-  (doseq [elem-count [10 50 100 150 200 1000 10000 100000 1000000]]
+  (doseq [elem-count [10 50 100 150 200 1000 10000 100000]]
     (println "elem-count" elem-count)
-    (let [^netlib_ccm.core.DenseVector y (m/array :netlib (repeat elem-count 1))
-          ^netlib_ccm.core.DenseVector x (m/array :netlib (repeat elem-count 2))
-          op-len elem-count
-          y-view (.getStridedView y)
-          x-view (.getStridedView x)]
-      (print "closure:")
-      (time (dotimes [iter 1000]
-              (sv/strided-view-multiple-op! y-view
-                                            x-view
-                                            (fn [lhs-data lhs-offset rhs-data rhs-offset op-len]
-                                              (Ops/OpXY op-len rhs-data rhs-offset
-                                                        lhs-data lhs-offset
-                                                        (reify netlib_ccm.IBinaryOp
-                                                          (op [this rhs-val lhs-val]
-                                                            (/ lhs-val rhs-val)))))
-                                            (fn [^doubles lhs-data ^long lhs-offset
-                                                 ^long op-len ^double rhs-val]
-                                              (Ops/OpY op-len lhs-data lhs-offset
-                                                       (reify netlib_ccm.IUnaryOp
-                                                         (op [this lhs-val]
-                                                           (/ lhs-val rhs-val))))))))
-      (print "macro   :")
-      (time (dotimes [iter 1000]
-              (sv/strided-view-binary-java-op! y-view x-view (/ lhs-value rhs-value))))))
-  )
+    (let [y (m/array :netlib (repeat elem-count 1))
+          yb (m/array :netlib (repeat elem-count 2))
+          a (m/mutable (m/array :vectorz (repeat elem-count 3)))
+          ab (m/mutable (m/array :vectorz (repeat elem-count 4)))
+          op-len elem-count]
+      (print "netlib :")
+      (time (dotimes [iter 100]
+              (m/div! y yb)))
+
+      (print "vectorz:")
+      (time (dotimes [iter 100]
+              (m/div! a ab))))))
+
+(defn perf-test-mul!
+  []
+  (doseq [elem-count [10 50 100 150 200 1000 10000 100000]]
+    (println "elem-count" elem-count)
+    (let [y (m/array :netlib (repeat elem-count 1))
+          yb (m/array :netlib (repeat elem-count 2))
+          a (m/mutable (m/array :vectorz (repeat elem-count 3)))
+          ab (m/mutable (m/array :vectorz (repeat elem-count 4)))
+          ^doubles y-data (.data y)
+          ^doubles yb-data (.data yb)
+          ^StridedBuffer y-buf (.getStridedBuffer y)
+          ^StridedBuffer yb-buf (.getStridedBuffer yb)
+          op-len (long elem-count)
+          iter-count 1000]
+      (print "netlib :")
+      (time (dotimes [iter iter-count]
+              (m/mul! y yb)))
+
+      (print "vectorz:")
+      (time (dotimes [iter iter-count]
+              (m/mul! a ab))))))
+
+
+(defn perf-test-assign!
+  []
+  (doseq [elem-count [10 50 100 150 200 1000 10000 100000]]
+    (println "elem-count" elem-count)
+    (let [y (m/array :netlib (repeat elem-count 1))
+          yb (m/array :netlib (repeat elem-count 2))
+          a (m/mutable (m/array :vectorz (repeat elem-count 3)))
+          ab (m/mutable (m/array :vectorz (repeat elem-count 4)))
+          ^doubles y-data (.data y)
+          ^doubles yb-data (.data yb)
+          ^StridedBuffer y-buf (.getStridedBuffer y)
+          ^StridedBuffer yb-buf (.getStridedBuffer yb)
+          op-len (long elem-count)
+          iter-count 1000]
+      (print "netlib :")
+      (time (dotimes [iter iter-count]
+              (m/assign! y yb)))
+
+      (print "vectorz:")
+      (time (dotimes [iter iter-count]
+              (m/assign! a ab))))))
 
 
 (defn get-padded-strided-dimension
@@ -491,3 +526,22 @@ of the output of a conv-net ignoring channels."
 (deftest test-adadelta-middle
   (is (= (m/eseq (adadelta-middle :vectorz))
          (m/eseq (adadelta-middle :netlib)))))
+
+
+
+
+
+
+(defn -main
+  [& args]
+  (dotimes [n 4]
+    (println "###SQRT")
+    (perf-test-sqrt!)
+    (println "###DIV!")
+    (perf-test-div!)
+    (println "###MUL!")
+    (perf-test-mul!)
+    (println "###ASSIGN!")
+    (perf-test-assign!)
+    (println "ELEMENT-MULTIPLY!!")
+    (perf-test-element-multiply)))

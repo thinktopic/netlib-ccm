@@ -638,4 +638,14 @@ public final class StridedBuffer
 	return false;
     }
 
+    public static void MulTest( StridedBuffer lhs, StridedBuffer rhs, int iter_count )
+    {
+	double[] rhs_data = rhs.data;
+	double[] lhs_data = lhs.data;
+	int op_len = rhs_data.length;
+	for ( int idx = 0; idx < iter_count; ++idx ) {
+	    Ops.AY( op_len, rhs_data, 0, lhs_data, 0 );
+	}
+    }
+
 }
